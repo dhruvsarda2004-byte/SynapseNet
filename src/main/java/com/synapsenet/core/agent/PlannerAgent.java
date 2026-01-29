@@ -6,8 +6,10 @@ import org.springframework.stereotype.Component;
 
 import com.synapsenet.communication.EventBus;
 import com.synapsenet.communication.SynapseEventListener;
+import com.synapsenet.config.ExecutionModeResolver;
 import com.synapsenet.core.event.Event;
 import com.synapsenet.core.event.EventType;
+import com.synapsenet.core.planner.PlannerOutput;
 import com.synapsenet.core.task.TaskService;
 import com.synapsenet.llm.LLMClient;
 
@@ -20,11 +22,18 @@ public class PlannerAgent implements Agent, SynapseEventListener {
     private final TaskService taskService;
     private final EventBus eventBus;
     private final LLMClient llmClient;
+    private final ExecutionModeResolver modeResolver;
 
-    public PlannerAgent(TaskService taskService, EventBus eventBus ,  LLMClient llmClient) {
+    public PlannerAgent(
+            TaskService taskService,
+            EventBus eventBus,
+            LLMClient llmClient,
+            ExecutionModeResolver modeResolver
+    ) {
         this.taskService = taskService;
         this.eventBus = eventBus;
         this.llmClient = llmClient;
+        this.modeResolver = modeResolver;
     }
 
     @Override
@@ -37,50 +46,153 @@ public class PlannerAgent implements Agent, SynapseEventListener {
         return AgentType.PLANNER;
     }
 
+    /**
+     * =========================
+     * CIR ENTRY POINT
+     * =========================
+     *
+     * Used ONLY by the CIR orchestrator.
+     * No events are published here.
+     */
+    public PlannerOutput generatePlan(
+            String taskId,
+            PlannerOutput previousPlan
+    ) {
+        log.info(
+            "[PlannerAgent][CIR] Generating plan for task {}",
+            taskId
+        );
+
+        String prompt = buildCIRPlanningPrompt(taskId, previousPlan);
+        String planText = llmClient.generate(prompt);
+
+        return new PlannerOutput(
+                taskId,
+                getAgentId(),
+                taskId, // original task (can evolve later)
+                planText
+        );
+    }
+
+    /**
+     * =========================
+     * EIR ENTRY POINT
+     * =========================
+     *
+     * Event-driven planner behavior.
+     * Used in production mode.
+     */
     @Override
     public void handleTask(String taskId) {
-        log.info("[PlannerAgent] Planning task {}", taskId);
 
-        // Existing behavior
+        if (modeResolver.isCIR()) {
+            // CIR ignores event-driven execution
+            return;
+        }
+
+        log.info("[PlannerAgent][EIR] Planning task {}", taskId);
+
         taskService.assignTask(taskId);
 
-        String prompt = buildPlanningPrompt(taskId);
-        String plan = llmClient.generate(prompt); 
-        
+        String prompt = buildEIRPlanningPrompt(taskId);
+        String planText = llmClient.generate(prompt);
 
-        // You may keep this if it’s part of orchestration
-        taskService.assignTask(taskId);
+        PlannerOutput plannerOutput = new PlannerOutput(
+                taskId,
+                getAgentId(),
+                taskId,
+                planText
+        );
+
+        eventBus.publish(
+                new Event(
+                        EventType.PLAN_PRODUCED,
+                        getAgentId(),
+                        plannerOutput
+                )
+        );
 
         AgentResult result = new AgentResult(
                 taskId,
                 getAgentType(),
                 getAgentId(),
-                plan
+                planText
         );
 
-        eventBus.publish(new Event(
-                EventType.AGENT_RESULT_PRODUCED, // as we see agent result produced it is then stored in the store 
-                getAgentId(),
-                result
-        ));
+        eventBus.publish(
+                new Event(
+                        EventType.AGENT_RESULT_PRODUCED,
+                        getAgentId(),
+                        result
+                )
+        );
     }
 
+    /**
+     * Event listener for EIR mode only.
+     */
     @Override
     public void onEvent(Event event) {
+
+        if (modeResolver.isCIR()) {
+            return;
+        }
+
         if (event.getType() == EventType.TASK_CREATED) {
             String taskId = event.getPayload().toString();
-            handleTask(taskId);  // handletask only when event type = task created 
-        } 
+            handleTask(taskId);
+        }
     }
-    
-    private String buildPlanningPrompt(String taskId) {
+
+    // =========================
+    // PROMPT BUILDERS
+    // =========================
+
+    /**
+     * CIR prompt supports iterative refinement.
+     */
+    private String buildCIRPlanningPrompt(
+            String taskId,
+            PlannerOutput previousPlan
+    ) {
+        if (previousPlan == null) {
+            return """
+            You are a planning agent.
+
+            Task:
+            %s
+
+            Produce a clear, step-by-step plan.
+            """.formatted(taskId);
+        }
+
+        return """
+        You are refining an earlier plan.
+
+        Task:
+        %s
+
+        Previous Plan:
+        %s
+
+        Improve the plan by fixing issues and adding missing details.
+        """.formatted(
+                taskId,
+                previousPlan.getPlanText()
+        );
+    }
+
+    /**
+     * EIR prompt (single-pass planning).
+     */
+    private String buildEIRPlanningPrompt(String taskId) {
         return """
         You are a planning agent.
+
         Given the following task ID, produce a clear step-by-step plan.
 
         Task ID:
         %s
-        """.formatted(taskId);  // formatted is used to replace %s 
+        """.formatted(taskId);
     }
-
 }
