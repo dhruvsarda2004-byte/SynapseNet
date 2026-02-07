@@ -1,0 +1,44 @@
+{
+  "PC1-Q1": {
+    "P1_PLANNER_ONLY": {
+      "correctness": 4.5,
+      "completeness": 3.5,
+      "clarity": 4.0,
+      "selfCorrection": 0.0,
+      "safety": 4.5,
+      "notes": "Correct high-level idea but lacks explicit R-loop, nuclease domain detail, and repair distinction."
+    },
+    "P2_PLANNER_EXECUTOR": {
+      "correctness": 4.0,
+      "completeness": 3.0,
+      "clarity": 4.5,
+      "selfCorrection": 0.0,
+      "safety": 4.5,
+      "notes": "Clean single-line output but missing PAM specificity and repair pathway context."
+    },
+    "P3_PLANNER_CRITIC_EXECUTOR": {
+      "correctness": 4.7,
+      "completeness": 3.8,
+      "clarity": 4.8,
+      "selfCorrection": 3.5,
+      "safety": 4.5,
+      "notes": "Critic improves precision by enforcing PAM mention; still compact but accurate."
+    },
+    "P4_PLANNER_CRITIC_MEDIATOR_EXECUTOR": {
+      "correctness": 4.8,
+      "completeness": 4.5,
+      "clarity": 4.9,
+      "selfCorrection": 4.2,
+      "safety": 4.5,
+      "notes": "Mediator helps balance density and clarity; best one-line explanatory tradeoff."
+    },
+    "P5_FULL_ITERATIVE_CIR": {
+      "correctness": 5.0,
+      "completeness": 4.6,
+      "clarity": 5.0,
+      "selfCorrection": 5.0,
+      "safety": 4.5,
+      "notes": "Iterative refinement converges to maximally precise and well-phrased molecular explanation."
+    }
+  }
+}
