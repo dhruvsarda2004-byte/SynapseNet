@@ -1,5 +1,6 @@
 package com.synapsenet.llm;
 
+import com.synapsenet.core.agent.AgentType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -19,16 +20,14 @@ import java.util.Random;
 @Profile("gemini")
 public class GeminiLLMClient implements LLMClient {
 
-    private static final Logger log =
-            LoggerFactory.getLogger(GeminiLLMClient.class);
+    private static final Logger log = LoggerFactory.getLogger(GeminiLLMClient.class);
 
-    /** Retry configuration (hardcoded for research determinism) */
-    private static final int MAX_RETRIES = 3;
+    private static final int  MAX_RETRIES    = 3;
     private static final long BASE_BACKOFF_MS = 500;
-    private static final long MAX_JITTER_MS = 250;
+    private static final long MAX_JITTER_MS  = 250;
 
-    private final WebClient webClient;
-    private final Random jitterRandom = new Random();
+    private final WebClient    webClient;
+    private final Random       jitterRandom = new Random();
 
     @Value("${gemini.api.key}")
     private String apiKey;
@@ -43,30 +42,43 @@ public class GeminiLLMClient implements LLMClient {
         this.webClient = builder.build();
     }
 
+    // =========================================================================
+    // LLMClient — generateWithRole (primary interface method)
+    // Gemini does not support separate system prompts in this integration,
+    // so role and temperature are accepted but only the prompt is forwarded.
+    // =========================================================================
+
+    @Override
+    public String generateWithRole(AgentType role, String userPrompt, double temperature) {
+        log.debug("[Gemini] generateWithRole role={} temperature={}", role, temperature);
+        // Gemini REST API does not accept temperature in this integration path.
+        // Forward the prompt via generate() which handles retries and response parsing.
+        return generate(userPrompt);
+    }
+
+    // =========================================================================
+    // LLMClient — generate (Gemini-specific implementation with retry logic)
+    // Overrides the interface default to use Gemini's REST API instead of
+    // delegating to generateWithRole.
+    // =========================================================================
+
     @Override
     public String generate(String prompt) {
 
-        log.info("Using Gemini | model={} | keyHash={}",
-                model, apiKey.hashCode());
+        log.info("[Gemini] Calling model={} keyHash={}", model, apiKey.hashCode());
 
         Map<String, Object> body = Map.of(
             "contents", List.of(
-                Map.of(
-                    "parts", List.of(
-                        Map.of("text", prompt)
-                    )
-                )
+                Map.of("parts", List.of(Map.of("text", prompt)))
             )
         );
 
         int attempt = 0;
-        int retryCount = 0;
 
         while (true) {
             try {
                 attempt++;
-
-                log.debug("[Gemini] Attempt {} sending request", attempt);
+                log.debug("[Gemini] Attempt {}", attempt);
 
                 Map<?, ?> response = webClient
                         .post()
@@ -79,86 +91,60 @@ public class GeminiLLMClient implements LLMClient {
                         .timeout(Duration.ofSeconds(15))
                         .block();
 
-                retryCount = attempt - 1;
-
-                log.info(
-                    "[Gemini] Call succeeded | retries={}",
-                    retryCount
-                );
-
+                log.info("[Gemini] Succeeded after {} attempt(s)", attempt);
                 return extractText(response);
 
             } catch (Exception ex) {
-
                 if (!isRetryable(ex) || attempt > MAX_RETRIES) {
-
-                    retryCount = attempt - 1;
-
-                    log.error(
-                        "[Gemini] Final failure | attempts={} | retries={}",
-                        attempt,
-                        retryCount,
-                        ex
-                    );
-
+                    log.error("[Gemini] Final failure after {} attempt(s)", attempt, ex);
                     throw ex;
                 }
-
                 long backoff = computeBackoff(attempt);
-
-                log.warn(
-                    "[Gemini] Transient failure on attempt {}. Retrying after {} ms. Cause: {}",
-                    attempt,
-                    backoff,
-                    rootMessage(ex)
-                );
-
+                log.warn("[Gemini] Transient failure attempt {}. Retrying in {}ms. Cause: {}",
+                        attempt, backoff, rootMessage(ex));
                 sleep(backoff);
             }
         }
     }
 
+    // =========================================================================
+    // Private helpers
+    // =========================================================================
+
     @SuppressWarnings("unchecked")
     private String extractText(Map<?, ?> response) {
         try {
             var candidates = (List<Map<String, Object>>) response.get("candidates");
-            var content = (Map<String, Object>) candidates.get(0).get("content");
-            var parts = (List<Map<String, Object>>) content.get("parts");
+            var content    = (Map<String, Object>) candidates.get(0).get("content");
+            var parts      = (List<Map<String, Object>>) content.get("parts");
             return parts.get(0).get("text").toString();
         } catch (Exception e) {
-            log.error("Failed to parse Gemini response: {}", response, e);
+            log.error("[Gemini] Failed to parse response: {}", response, e);
             throw new IllegalStateException("Malformed Gemini response", e);
         }
     }
 
-    /** Retry only transient failures (Spring-version safe) */
     private boolean isRetryable(Exception ex) {
-        return ex instanceof WebClientResponseException.ServiceUnavailable   // 503
-            || ex instanceof WebClientResponseException.TooManyRequests      // 429
+        return ex instanceof WebClientResponseException.ServiceUnavailable
+            || ex instanceof WebClientResponseException.TooManyRequests
             || ex instanceof IOException
             || ex.getCause() instanceof IOException;
     }
 
-    /** Exponential backoff with jitter */
     private long computeBackoff(int attempt) {
         long exponential = BASE_BACKOFF_MS * (1L << (attempt - 1));
-        long jitter = jitterRandom.nextLong(MAX_JITTER_MS + 1);
+        long jitter      = jitterRandom.nextLong(MAX_JITTER_MS + 1);
         return exponential + jitter;
     }
 
     private void sleep(long millis) {
-        try {
-            Thread.sleep(millis);
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-        }
+        try { Thread.sleep(millis); }
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
     }
 
     private String rootMessage(Throwable t) {
         Throwable cause = t;
-        while (cause.getCause() != null) {
-            cause = cause.getCause();
-        }
+        while (cause.getCause() != null) cause = cause.getCause();
         return cause.getMessage();
     }
 }
