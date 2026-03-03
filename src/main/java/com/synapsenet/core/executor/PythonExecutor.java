@@ -27,7 +27,7 @@ public class PythonExecutor {
 
     public PythonExecutor(
             @Value("${synapsenet.workspace.path}") String workspacePath,
-            @Value("${synapsenet.python.interpreter}") String pythonInterpreter
+            @Value("${synapsenet.python.executable}") String pythonInterpreter
     ) {
         this.workingDirectory = Path.of(workspacePath);
         this.pythonInterpreter = pythonInterpreter;
@@ -36,7 +36,18 @@ public class PythonExecutor {
         log.info("[PythonExecutor] Python: {}", pythonInterpreter);
     }
 
-    private String getPythonExecutable() {
+    // -------------------------------------------------------------------------
+    // CHANGE 1: visibility private → public
+    //
+    // WHY: SimpleTaskOrchestrator.runPreflightCommand() was hardcoding "python",
+    // ignoring synapsenet.python.interpreter entirely. Making this method public
+    // allows the orchestrator to reuse the single canonical interpreter resolution
+    // path rather than duplicating @Value injection or the null/blank fallback.
+    //
+    // This method is the ONE place that decides which Python binary is used.
+    // All callers — PreFlight and runtime execution — now go through here.
+    // -------------------------------------------------------------------------
+    public String getPythonExecutable() {
         if (pythonInterpreter != null && !pythonInterpreter.isBlank()) {
             return pythonInterpreter;
         }

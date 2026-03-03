@@ -4,7 +4,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-import com.synapsenet.core.executor.TestResults;
 import com.synapsenet.core.planner.PlannerOutput;
 import com.synapsenet.core.state.RepairAttempt;
 import com.synapsenet.core.state.RepairPhase;
@@ -63,7 +62,17 @@ public class PlannerAgent implements Agent {
 
         log.info("[Planner] Revising repair strategy");
 
+        // [FIX Medium #11] After workspace restore, clearFailureContext() nulls
+        // failingArtifact before revisePlan() is called. Recover it from the
+        // preserved lastRootCauseAnalysis so the replan prompt stays grounded.
+        // Does NOT mutate state — read-only fallback for prompt construction only.
         String failingFileAtReplan = state.getFailingArtifact();
+        if (failingFileAtReplan == null && state.getLastRootCauseAnalysis() != null) {
+            failingFileAtReplan = state.getLastRootCauseAnalysis().getArtifactPath();
+            log.info("[Planner] failing_artifact null after restore — recovered from RCA: {}",
+                     failingFileAtReplan);
+        }
+
         log.info("[Signal] failing_artifact at replanning: {}", failingFileAtReplan);
 
         if (failingFileAtReplan == null) {
@@ -168,14 +177,6 @@ public class PlannerAgent implements Agent {
      * The Executor injects raw pytest failure output and file content.
      * The LLM must determine the root cause artifact from the evidence,
      * not from the task string.
-     *
-     * Previous implementation injected "Analyze the failure in rewrite.py near line 300"
-     * which contradicted the raw exception output pointing to config/__init__.py.
-     * The model correctly trusted the evidence but failed artifact path validation,
-     * creating an unresolvable loop.
-     *
-     * The Executor already states the analyzer-identified artifact in the prompt body
-     * as context — it is NOT the authoritative diagnostic anchor here.
      */
     private String buildRepairAnalyzePrompt(String goal, String failureContext, SharedState state) {
 
@@ -210,17 +211,10 @@ public class PlannerAgent implements Agent {
      * CRITICAL ARCHITECTURE CONSTRAINT:
      * The Mediator requires hasPatch==true on EVERY task in REPAIR_PATCH phase.
      * Always generate exactly ONE task that patches in the same LLM response.
-     *
-     * Fix B corollary: The repair target here comes from the validated
-     * RootCauseAnalysis.artifactPath (what the LLM diagnosed), NOT from the
-     * PytestOutputAnalyzer's heuristic artifact. If analysis is valid, use its
-     * artifact. Fallback to analyzer artifact only if no valid analysis exists.
      */
     private String buildRepairPatchPrompt(String goal, String failureContext,
                                           String failingFile, SharedState state) {
 
-        // Prefer the diagnosed artifact from RootCauseAnalysis over analyzer heuristic.
-        // The analysis artifact is what the LLM actually diagnosed as the bug site.
         String candidateFile;
         RootCauseAnalysis analysis = state.getLastRootCauseAnalysis();
         if (analysis != null && analysis.isValid() && analysis.getArtifactPath() != null) {
@@ -256,7 +250,7 @@ public class PlannerAgent implements Agent {
         } else {
             exampleSteps = """
           "repair_steps": [
-            "Explore src/ with list_files to find the source file, read it, and apply the fix described in the Root Cause Analysis using replace_in_file. You MUST call replace_in_file before finishing."
+            "Use list_files or file_tree to find the source file that contains the bug, read it, and apply the fix described in the Root Cause Analysis using replace_in_file. You MUST call replace_in_file before finishing."
           ]""";
 
             finalReminders = """
@@ -297,6 +291,10 @@ public class PlannerAgent implements Agent {
         );
     }
 
+    /**
+     * Resolve the repair target from the failing artifact.
+     * Layout-agnostic: classification uses filename convention only.
+     */
     private String resolveRepairTarget(String failingArtifact, SharedState state) {
 
         if (failingArtifact == null) {
@@ -304,47 +302,19 @@ public class PlannerAgent implements Agent {
             return null;
         }
 
-        boolean isSourceFile = failingArtifact.startsWith("src/") ||
-                               failingArtifact.startsWith("_pytest/") ||
-                               (!failingArtifact.startsWith("testing/") &&
-                                !failingArtifact.startsWith("tests/"));
+        String filename = failingArtifact.contains("/")
+                ? failingArtifact.substring(failingArtifact.lastIndexOf('/') + 1)
+                : failingArtifact;
 
-        if (isSourceFile) {
+        boolean isTestFile = filename.startsWith("test_") || filename.endsWith("_test.py");
+
+        if (!isTestFile) {
             log.info("[Planner] Artifact is source file — using directly: {}", failingArtifact);
             return failingArtifact;
         }
 
-        log.info("[Planner] Artifact is test file — attempting generic source derivation: {}", failingArtifact);
-        String derived = deriveSourceFromTestPath(failingArtifact);
-
-        if (derived != null) {
-            log.info("[Planner] Derived source target: {}", derived);
-        } else {
-            log.warn("[Planner] Could not derive source from test path: {} — will use discovery fallback",
-                    failingArtifact);
-        }
-
-        return derived;
-    }
-
-    private String deriveSourceFromTestPath(String testArtifact) {
-
-        String testFile = testArtifact.contains("::") ? testArtifact.split("::")[0] : testArtifact;
-
-        if (testFile.startsWith("testing/test_")) {
-            String moduleName = testFile
-                    .replace("testing/test_", "")
-                    .replace(".py", "");
-            return "src/_pytest/" + moduleName + ".py";
-        }
-
-        if (testFile.startsWith("tests/test_")) {
-            String moduleName = testFile
-                    .replace("tests/test_", "")
-                    .replace(".py", "");
-            return "src/" + moduleName + ".py";
-        }
-
+        log.info("[Planner] Artifact is test file — source derivation suppressed " +
+                 "(layout-agnostic mode). Discovery fallback will be used: {}", failingArtifact);
         return null;
     }
 
@@ -377,6 +347,9 @@ public class PlannerAgent implements Agent {
 
     private String buildReplanPrompt(String goal, SharedState state) {
 
+        // [FIX Medium #11] buildFailureContext reads state.getFailingArtifact() directly.
+        // After workspace restore that field is null. Inject the recovered artifact
+        // into the context via the overloaded helper rather than state mutation.
         String failureContext     = buildFailureContext(state);
         String repairHistoryBlock = buildRepairHistorySection(state);
         String priorAnalysisBlock = buildPriorAnalysisSection(state);
@@ -462,7 +435,6 @@ Output ONLY valid JSON.
             }
 
             case REPAIR_ANALYZE: {
-                // Fix B: No file/line anchor in fallback task either
                 String fallbackJson = """
                     {
                       "repair_steps": [
@@ -475,14 +447,13 @@ Output ONLY valid JSON.
             }
 
             case REPAIR_PATCH: {
-                // Use diagnosed artifact from analysis if available, else analyzer heuristic
                 String target;
                 RootCauseAnalysis analysis = state.getLastRootCauseAnalysis();
                 if (analysis != null && analysis.isValid() && analysis.getArtifactPath() != null) {
                     target = analysis.getArtifactPath();
                 } else {
                     String derived = resolveRepairTarget(state.getFailingArtifact(), state);
-                    target = derived != null ? derived : "src/ (explore with list_files to find the relevant file)";
+                    target = derived != null ? derived : "(use list_files or file_tree to discover the relevant source file)";
                 }
                 String fallbackJson = """
                     {
@@ -542,7 +513,18 @@ Output ONLY valid JSON.
             ctx.append("- Pytest output:\n").append(truncated).append("\n");
         }
 
+        // [FIX Medium #11] After workspace restore, state.getFailingArtifact() is null.
+        // Fall back to the artifact path stored in the preserved lastRootCauseAnalysis
+        // so the replan prompt still contains the artifact grounding hint.
         String artifact = state.getFailingArtifact();
+        if (artifact == null && state.getLastRootCauseAnalysis() != null) {
+            artifact = state.getLastRootCauseAnalysis().getArtifactPath();
+            if (artifact != null) {
+                log.info("[Planner] buildFailureContext: failingArtifact null — recovered from RCA: {}",
+                         artifact);
+            }
+        }
+
         if (artifact != null) {
             ctx.append("- Analyzer-identified frame: ").append(artifact)
                .append(" (heuristic — actual root cause may differ)\n");

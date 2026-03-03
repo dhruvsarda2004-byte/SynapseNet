@@ -1,6 +1,7 @@
 package com.synapsenet.core.state;
 
-import org.slf4j.LoggerFactory;
+// [Fix 4] PathNormalizer is the single source of truth for path normalization.
+import com.synapsenet.core.util.PathNormalizer;
 
 /**
  * Typed result of REPAIR_ANALYZE phase.
@@ -13,14 +14,32 @@ import org.slf4j.LoggerFactory;
  * VALIDATION RULES (deterministic — no numeric confidence):
  *   1. artifactPath non-empty AND matches state.getFailingArtifact()
  *   2. artifactLine > 0 AND within ±ARTIFACT_LINE_TOLERANCE of state.getFailingArtifactLine()
- *      (line check skipped if failingArtifactLine == -1, i.e. unknown)
+ *      ONLY when LLM-identified artifact is the SAME FILE as the analyzer-reported artifact.
+ *      When the LLM correctly identifies a different source file (cross-file reasoning),
+ *      line numbers in two different files have no mathematical relationship — the
+ *      tolerance check is skipped entirely.
+ *      (line check also skipped if failingArtifactLine == -1, i.e. unknown)
  *   3. rootCauseSummary non-empty
  *   4. causalExplanation non-empty
  *   5. minimalFixStrategy non-empty
- *   6. proposedSearchBlock present AND approximately found in cached file content
- *      (normalized whitespace comparison — not naive substring)
  *
- * All conditions must be true for hasValidRootCauseAnalysis() to return true.
+ * NOTE ON proposedSearchBlock:
+ *   Retained for traceability and debugging — represents the LLM's perceived faulty
+ *   snippet. NOT used for replace_in_file matching. The system-extracted
+ *   authoritativeSearchBlock is used for all actual patching.
+ *
+ *   This separation cleanly splits responsibilities:
+ *     authoritativeSearchBlock → system grounding (deterministic, collision-safe)
+ *     proposedSearchBlock      → model reasoning  (informational, research signal)
+ *
+ * NOTE ON authoritativeSearchBlock:
+ *   Extracted deterministically by ExecutorAgent after grounding confirms the
+ *   diagnosed file is readable. Uses AUTHORITATIVE_BLOCK_RADIUS lines centered
+ *   on artifactLine. Set via withAuthoritativeSearchBlock() after construction
+ *   since it requires file content not available at parse time.
+ *   Stored here (not transient state) so REPLAN cycles preserve it.
+ *
+ * All conditions 1-5 must be true for hasValidRootCauseAnalysis() to return true.
  */
 public final class RootCauseAnalysis {
 
@@ -48,11 +67,22 @@ public final class RootCauseAnalysis {
     private final String whyPreviousAttemptsFailed;
 
     /**
-     * The exact search_block the LLM intends to use in REPAIR_PATCH.
-     * Validated against cached file content (normalized) before advancing.
-     * Optional — if null, feasibility check is skipped (no false rejection).
+     * The search block the LLM perceived as faulty during REPAIR_ANALYZE.
+     * Retained for traceability and debugging signal only.
+     * NOT used for replace_in_file matching — see authoritativeSearchBlock.
      */
     private final String proposedSearchBlock;
+
+    /**
+     * System-extracted search block: AUTHORITATIVE_BLOCK_RADIUS lines centered
+     * on artifactLine, taken verbatim from the cached file after grounding.
+     *
+     * This is the only block passed to replace_in_file.
+     * The LLM cannot hallucinate it — it comes from the actual file.
+     *
+     * Null until set via withAuthoritativeSearchBlock() after grounding succeeds.
+     */
+    private final String authoritativeSearchBlock;
 
     private final boolean valid;
     private final String  invalidReason;
@@ -63,8 +93,7 @@ public final class RootCauseAnalysis {
 
     /**
      * Normal constructor — runs deterministic validation.
-     * fileContent is the concatenated content of all cached files, used for
-     * proposedSearchBlock feasibility check. May be null (check skipped).
+     * cachedFileContent parameter retained for API compatibility.
      */
     private RootCauseAnalysis(
             String artifactPath,
@@ -74,6 +103,7 @@ public final class RootCauseAnalysis {
             String minimalFixStrategy,
             String whyPreviousAttemptsFailed,
             String proposedSearchBlock,
+            String authoritativeSearchBlock,
             String knownArtifact,
             int    knownArtifactLine,
             String cachedFileContent
@@ -85,12 +115,12 @@ public final class RootCauseAnalysis {
         this.minimalFixStrategy        = minimalFixStrategy;
         this.whyPreviousAttemptsFailed = whyPreviousAttemptsFailed;
         this.proposedSearchBlock       = proposedSearchBlock;
+        this.authoritativeSearchBlock  = authoritativeSearchBlock;
 
         String reason = validate(
                 artifactPath, artifactLine, rootCauseSummary,
                 causalExplanation, minimalFixStrategy,
-                proposedSearchBlock, knownArtifact, knownArtifactLine,
-                cachedFileContent
+                knownArtifact, knownArtifactLine
         );
         this.valid         = (reason == null);
         this.invalidReason = reason;
@@ -108,6 +138,7 @@ public final class RootCauseAnalysis {
         this.minimalFixStrategy        = null;
         this.whyPreviousAttemptsFailed = null;
         this.proposedSearchBlock       = null;
+        this.authoritativeSearchBlock  = null;
         this.valid                     = false;
         this.invalidReason             = invalidReason;
     }
@@ -118,10 +149,10 @@ public final class RootCauseAnalysis {
 
     /**
      * Build a RootCauseAnalysis from parsed field values.
+     * authoritativeSearchBlock starts null — set after grounding via
+     * withAuthoritativeSearchBlock().
      *
-     * @param cachedFileContent  concatenated content of all files in state.getRecentFileReads()
-     *                           used for proposedSearchBlock feasibility check.
-     *                           Pass null to skip the check.
+     * @param cachedFileContent  retained for call-site compatibility; unused.
      */
     public static RootCauseAnalysis of(
             String artifactPath,
@@ -138,7 +169,9 @@ public final class RootCauseAnalysis {
         return new RootCauseAnalysis(
                 artifactPath, artifactLine, rootCauseSummary,
                 causalExplanation, minimalFixStrategy, whyPreviousAttemptsFailed,
-                proposedSearchBlock, knownArtifact, knownArtifactLine,
+                proposedSearchBlock,
+                null,  // authoritativeSearchBlock — set after grounding
+                knownArtifact, knownArtifactLine,
                 cachedFileContent
         );
     }
@@ -151,27 +184,64 @@ public final class RootCauseAnalysis {
         return new RootCauseAnalysis(reason, false);
     }
 
+    /**
+     * Return a copy of this analysis with authoritativeSearchBlock set.
+     *
+     * Called by ExecutorAgent after grounding confirms the diagnosed file
+     * is readable and the line number is within bounds.
+     *
+     * Uses the full-fidelity copy constructor to preserve valid/invalidReason
+     * exactly — validation is NOT re-run (it already completed at construction).
+     */
+    public RootCauseAnalysis withAuthoritativeSearchBlock(String block) {
+        return new RootCauseAnalysis(
+                this.artifactPath,
+                this.artifactLine,
+                this.rootCauseSummary,
+                this.causalExplanation,
+                this.minimalFixStrategy,
+                this.whyPreviousAttemptsFailed,
+                this.proposedSearchBlock,
+                block,
+                this.valid,
+                this.invalidReason
+        );
+    }
+
+    /**
+     * Full-fidelity copy constructor — preserves valid/invalidReason exactly.
+     * Used only by copyWithAuthoritativeBlock().
+     */
+    private RootCauseAnalysis(
+            String  artifactPath,
+            int     artifactLine,
+            String  rootCauseSummary,
+            String  causalExplanation,
+            String  minimalFixStrategy,
+            String  whyPreviousAttemptsFailed,
+            String  proposedSearchBlock,
+            String  authoritativeSearchBlock,
+            boolean valid,
+            String  invalidReason
+    ) {
+        this.artifactPath              = artifactPath;
+        this.artifactLine              = artifactLine;
+        this.rootCauseSummary          = rootCauseSummary;
+        this.causalExplanation         = causalExplanation;
+        this.minimalFixStrategy        = minimalFixStrategy;
+        this.whyPreviousAttemptsFailed = whyPreviousAttemptsFailed;
+        this.proposedSearchBlock       = proposedSearchBlock;
+        this.authoritativeSearchBlock  = authoritativeSearchBlock;
+        this.valid                     = valid;
+        this.invalidReason             = invalidReason;
+    }
+
     // ----------------------------------------------------------------
     // Deterministic validation
     // ----------------------------------------------------------------
 
     /**
      * Returns null if valid, or a human-readable failure reason string.
-     *
-     * Fix A: Artifact path check demoted from hard-reject to soft (never blocks).
-     * PytestOutputAnalyzer heuristic picks the deepest non-test frame, which is
-     * where the failure manifests — not necessarily the root cause file.
-     * The LLM reads the raw exception and may correctly identify an upstream
-     * causal file. Hard-failing on path mismatch caused an unresolvable loop.
-     * Mismatch is logged in ExecutorAgent.parseAnalysis() for observability.
-     *
-     * Hard failures (enforced):
-     *   - Required text fields missing/empty
-     *   - artifactLine out of tolerance (when both known)
-     *   - proposedSearchBlock not found in cached file content
-     *
-     * Soft check (never blocks):
-     *   - artifactPath mismatch with knownArtifact
      */
     private static String validate(
             String artifactPath,
@@ -179,10 +249,8 @@ public final class RootCauseAnalysis {
             String rootCauseSummary,
             String causalExplanation,
             String minimalFixStrategy,
-            String proposedSearchBlock,
             String knownArtifact,
-            int    knownArtifactLine,
-            String cachedFileContent
+            int    knownArtifactLine
     ) {
         // Required text fields — hard fail
         if (isBlank(rootCauseSummary))   return "rootCauseSummary is missing or empty";
@@ -190,51 +258,17 @@ public final class RootCauseAnalysis {
         if (isBlank(minimalFixStrategy)) return "minimalFixStrategy is missing or empty";
         if (isBlank(artifactPath))       return "artifactPath is missing or empty";
 
-        // Artifact path: SOFT CHECK — never blocks (see Javadoc above).
-        // Mismatch logged by caller (ExecutorAgent.parseAnalysis) for observability.
+        // Artifact line — hard fail ONLY when same file AND both lines known
+        boolean sameFile = artifactPath != null
+                && knownArtifact != null
+                && normalizePath(artifactPath).equals(normalizePath(knownArtifact));
 
-        // Artifact line — hard fail only when both known and LLM provided one.
-        //
-        // TOLERANCE STRATEGY:
-        // We compute an effective file length from three sources, taking the maximum:
-        //   1. cachedFileContent line count — partial window, often truncated to 500 lines
-        //   2. knownArtifactLine * 4 — if the failure is at line 300, file is at least 1200 lines
-        //   3. artifactLine * 4 — same reasoning for the LLM-reported line
-        // This prevents tolerance collapse when only a partial window is cached.
-        //
-        // Tolerance = 20% of effective file length, floored at 75 lines.
-        if (knownArtifactLine > 0 && artifactLine > 0) {
-            int cachedLines = (cachedFileContent != null && !cachedFileContent.isEmpty())
-                    ? cachedFileContent.split("\n", -1).length
-                    : 0;
-            int effectiveFileLength = Math.max(cachedLines,
-                                      Math.max(knownArtifactLine * 4,
-                                               artifactLine * 4));
-            int dynamicTolerance = Math.max(75, (int)(effectiveFileLength * 0.20));
+        if (sameFile && knownArtifactLine > 0 && artifactLine > 0) {
             int delta = Math.abs(artifactLine - knownArtifactLine);
-            
-            // ===== DIAGNOSTIC LOGGING (PART 4) =====
-            // VALIDATION: Log structured metadata about tolerance check
-            LoggerFactory.getLogger(RootCauseAnalysis.class).info(
-                    "[VALIDATION] knownLine={}, proposedLine={}, delta={}, tolerance={}",
-                    knownArtifactLine,
-                    artifactLine,
-                    delta,
-                    dynamicTolerance);
-            
-            if (delta > dynamicTolerance) {
+            if (delta > ARTIFACT_LINE_TOLERANCE) {
                 return "artifactLine " + artifactLine + " is " + delta +
                        " lines from known failure line " + knownArtifactLine +
-                       " (tolerance=" + dynamicTolerance +
-                       ", effectiveFileLength=" + effectiveFileLength + ")";
-            }
-        }
-
-        // proposedSearchBlock feasibility — hard fail only when both present
-        if (!isBlank(proposedSearchBlock) && !isBlank(cachedFileContent)) {
-            if (!searchBlockExistsInContent(proposedSearchBlock, cachedFileContent)) {
-                return "proposedSearchBlock does not approximately match any content in cached files. " +
-                       "LLM must copy search_block from the file excerpt shown, not reconstruct from memory.";
+                       " (tolerance=" + ARTIFACT_LINE_TOLERANCE + ")";
             }
         }
 
@@ -242,71 +276,33 @@ public final class RootCauseAnalysis {
     }
 
     // ----------------------------------------------------------------
-    // Normalized search block feasibility check
+    // Path normalization — delegates to single source of truth
     // ----------------------------------------------------------------
 
     /**
-     * Check whether proposedSearchBlock approximately exists in fileContent.
-     *
-     * WHY NOT naive contains():
-     *   - Windowed injection may alter leading whitespace
-     *   - LLM may omit trailing spaces or use different line endings
-     *   - Minor indentation differences cause false rejections
-     *
-     * STRATEGY — normalize both sides then check:
-     *   1. Collapse all runs of whitespace within each line to a single space
-     *   2. Strip leading/trailing whitespace from each line
-     *   3. Remove blank lines
-     *   4. Join with \n and search for normalized block as substring of normalized content
-     *
-     * This is deterministic and tolerant of formatting differences while still
-     * catching hallucinated blocks that share no real code with the file.
-     *
-     * Minimum block length enforced: blocks under 10 normalized chars are skipped
-     * (too short to be meaningful — would match anywhere).
+     * [Fix 4] Delegates to PathNormalizer.normalize() — single source of truth.
+     * Removed local implementation (was: replace('\\','/').replaceAll("^\\./ ","").trim()).
+     * All path comparisons in the system must use one canonical normalizer.
      */
-    static boolean searchBlockExistsInContent(String searchBlock, String fileContent) {
-        String normBlock   = normalizeForSearch(searchBlock);
-        String normContent = normalizeForSearch(fileContent);
-
-        if (normBlock.length() < 10) {
-            // Too short to validate meaningfully — pass through
-            return true;
-        }
-
-        return normContent.contains(normBlock);
+    private static String normalizePath(String path) {
+        return PathNormalizer.normalize(path);
     }
 
+    // ----------------------------------------------------------------
+    // Strict search block feasibility check
+    // ----------------------------------------------------------------
+
     /**
-     * Normalize text for approximate search comparison.
-     * - Unify line endings to \n
-     * - Strip line-number prefixes ("  301 | " or ">> " added by extractFileWindow)
-     * - Trim each line
-     * - Collapse internal whitespace runs to single space
-     * - Remove blank lines
-     * - Join with \n
+     * Check whether a search block exists as an exact substring of fileContent.
+     * Utility for REPAIR_PATCH use — NOT called during REPAIR_ANALYZE validation.
      */
-    private static String normalizeForSearch(String text) {
-        if (text == null) return "";
-
-        // Unify line endings
-        String unified = text.replace("\r\n", "\n").replace("\r", "\n");
-
-        StringBuilder sb = new StringBuilder();
-        for (String line : unified.split("\n", -1)) {
-            // Strip extractFileWindow line-number prefix: "  301 | " or "   >> "
-            String stripped = line.replaceAll("^\\s*\\d+\\s*\\|\\s?", "")
-                                  .replaceAll("^\\s*>>\\s?", "");
-            // Strip SharedState truncation marker — must not appear in search content
-            // Marker format: "# <<< TRUNCATED: N lines omitted >>>"
-            if (stripped.trim().startsWith("# <<< TRUNCATED:")) continue;
-            // Trim and collapse internal whitespace
-            String trimmed = stripped.trim().replaceAll("\\s+", " ");
-            if (!trimmed.isEmpty()) {
-                sb.append(trimmed).append("\n");
-            }
-        }
-        return sb.toString().trim();
+    static boolean searchBlockExistsInContent(String searchBlock, String fileContent) {
+        if (isBlank(searchBlock) || isBlank(fileContent)) return false;
+        if (searchBlock.trim().length() < 10) return true;
+        if (fileContent.contains(searchBlock)) return true;
+        String normalizedBlock   = searchBlock.replace("\r\n", "\n").replace("\r", "\n");
+        String normalizedContent = fileContent.replace("\r\n", "\n").replace("\r", "\n");
+        return normalizedContent.contains(normalizedBlock);
     }
 
     // ----------------------------------------------------------------
@@ -317,24 +313,24 @@ public final class RootCauseAnalysis {
         return s == null || s.trim().isEmpty();
     }
 
-    private static String normalize(String path) {
-        if (path == null) return "";
-        return path.replace('\\', '/').replaceAll("^\\./", "").trim();
-    }
-
     // ----------------------------------------------------------------
     // Accessors
     // ----------------------------------------------------------------
 
-    public boolean isValid()                     { return valid; }
-    public String  getInvalidReason()            { return invalidReason; }
-    public String  getArtifactPath()             { return artifactPath; }
-    public int     getArtifactLine()             { return artifactLine; }
-    public String  getRootCauseSummary()         { return rootCauseSummary; }
-    public String  getCausalExplanation()        { return causalExplanation; }
-    public String  getMinimalFixStrategy()       { return minimalFixStrategy; }
-    public String  getWhyPreviousAttemptsFailed(){ return whyPreviousAttemptsFailed; }
-    public String  getProposedSearchBlock()      { return proposedSearchBlock; }
+    public boolean isValid()                       { return valid; }
+    public String  getInvalidReason()              { return invalidReason; }
+    public String  getArtifactPath()               { return artifactPath; }
+    public int     getArtifactLine()               { return artifactLine; }
+    public String  getRootCauseSummary()           { return rootCauseSummary; }
+    public String  getCausalExplanation()          { return causalExplanation; }
+    public String  getMinimalFixStrategy()         { return minimalFixStrategy; }
+    public String  getWhyPreviousAttemptsFailed()  { return whyPreviousAttemptsFailed; }
+    public String  getProposedSearchBlock()        { return proposedSearchBlock; }
+    public String  getAuthoritativeSearchBlock()   { return authoritativeSearchBlock; }
+
+    public boolean hasAuthoritativeSearchBlock() {
+        return !isBlank(authoritativeSearchBlock);
+    }
 
     // ----------------------------------------------------------------
     // Prompt injection rendering
@@ -343,6 +339,16 @@ public final class RootCauseAnalysis {
     /**
      * Render for REPAIR_PATCH prompt injection.
      * Only called when isValid() == true.
+     *
+     * Injects authoritativeSearchBlock as a mandatory, unmodifiable search block.
+     * The LLM is explicitly forbidden from altering it — only replace_block is
+     * under LLM control.
+     *
+     * proposedSearchBlock is shown as informational context only (what the LLM
+     * perceived as faulty), not as a matching candidate.
+     *
+     * If authoritativeSearchBlock is not yet set (should not happen in normal flow),
+     * falls back to proposedSearchBlock with a warning label.
      */
     public String toRepairPatchPromptBlock() {
         StringBuilder sb = new StringBuilder();
@@ -353,9 +359,27 @@ public final class RootCauseAnalysis {
         sb.append("Root cause  : ").append(rootCauseSummary).append("\n");
         sb.append("Explanation : ").append(causalExplanation).append("\n");
         sb.append("Fix strategy: ").append(minimalFixStrategy).append("\n");
-        if (!isBlank(proposedSearchBlock)) {
-            sb.append("Search block: use the block you identified in analysis as starting point.\n");
+
+        if (!isBlank(authoritativeSearchBlock)) {
+            sb.append("\n");
+            sb.append("=== AUTHORITATIVE SEARCH BLOCK (SYSTEM-EXTRACTED — DO NOT MODIFY) ===\n");
+            sb.append("This block was extracted VERBATIM from the actual file by the system.\n");
+            sb.append("You MUST use it character-for-character as your search_block.\n");
+            sb.append("You are NOT allowed to add, remove, or alter any character in it.\n");
+            sb.append("Only your replace_block is under your control.\n");
+            sb.append("```\n");
+            sb.append(authoritativeSearchBlock);
+            sb.append("```\n");
+            sb.append("=== END AUTHORITATIVE SEARCH BLOCK ===\n");
+        } else if (!isBlank(proposedSearchBlock)) {
+            // Fallback — should not occur in normal flow after grounding
+            sb.append("\n⚠ WARNING: No authoritative block available. ");
+            sb.append("Using LLM-proposed block as fallback (may not match exactly):\n");
+            sb.append("```\n");
+            sb.append(proposedSearchBlock);
+            sb.append("\n```\n");
         }
+
         sb.append("=== END ROOT CAUSE ANALYSIS ===");
         return sb.toString();
     }
@@ -382,6 +406,7 @@ public final class RootCauseAnalysis {
                ", cause=" + (rootCauseSummary != null ?
                    rootCauseSummary.substring(0, Math.min(60, rootCauseSummary.length())) : "null") +
                ", searchBlock=" + (proposedSearchBlock != null ? "present" : "absent") +
+               ", authoritativeBlock=" + (authoritativeSearchBlock != null ? "present" : "absent") +
                "}";
     }
 }

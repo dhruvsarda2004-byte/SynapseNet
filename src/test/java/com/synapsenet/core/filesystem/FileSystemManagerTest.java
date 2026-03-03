@@ -19,9 +19,10 @@ class FileSystemManagerTest {
 
     @BeforeEach
     void setUp() {
-        // FileSystemManager takes workspace path via constructor (no no-arg constructor,
-        // no setWorkspace — workspace is final and set at construction time).
-        fileSystem = new FileSystemManager(tempDir.toString());
+        fileSystem = new FileSystemManager(
+                tempDir.toString(),
+                "python"
+        );
     }
 
     @Test

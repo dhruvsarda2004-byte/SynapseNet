@@ -10,6 +10,7 @@ import com.synapsenet.core.agent.CriticAgent;
 import com.synapsenet.core.agent.MediatorAgent;
 import com.synapsenet.core.critic.CriticFeedback;
 import com.synapsenet.core.executor.ExecutionResult;
+import com.synapsenet.core.executor.PythonExecutor;
 import com.synapsenet.core.filesystem.FileSystemManager;
 import com.synapsenet.core.mediator.MediationDecision;
 import com.synapsenet.core.mediator.MediationResult;
@@ -18,26 +19,36 @@ import com.synapsenet.core.state.SharedState;
 import com.synapsenet.core.state.RepairPhase;
 import com.synapsenet.core.state.RepairAttempt;
 import com.synapsenet.core.state.RootCauseAnalysis;
+import com.synapsenet.core.state.RepairState;
+import com.synapsenet.core.state.RepairLifecycle;
+// [PathNormalizer] Import retained for reference — snapshot predicates migrated to p->true (Fix 1).
+// Remove this import if compiler warns unused.
 
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.io.IOException;
 
 /**
  * SimpleTaskOrchestrator — top-level controller for the Debugger CIR loop.
  *
- * Phase flow:  REPRODUCE → REPAIR_ANALYZE → REPAIR_PATCH → VALIDATE
+ * @version FSM_v1.0_FINAL
+ *
+ * Phase flow:  REPRODUCE -> REPAIR_ANALYZE -> REPAIR_PATCH -> VALIDATE
  *
  * Returns Map<String, Object> — no external DTO needed.
  * Keys: "success" (Boolean), "totalIterations" (Integer),
  *       "status" (String), "details" (String)
  *
- * Benchmark data is logged inline via logBenchmark() — no BenchmarkResult DTO.
- *
- * CIR REMOVAL CHECKLIST (nothing below should reference these):
- *   ✗ CIRResult
- *   ✗ BenchmarkResult
- *   ✗ com.synapsenet.orchestrator.dto.*
+ * Changes vs prior version:
+ *   [FIX Low #12] Null-task replan path now calls state.incrementReplanCount()
+ *                 in addition to incrementing the local consecutiveReplans counter.
+ *                 Previously these replans were invisible to the global replan counter,
+ *                 causing benchmark JSON replan_count to undercount total replans.
+ *   [PathNormalizer] Snapshot predicates now use PathNormalizer.normalize() instead of
+ *                    inline replace()/startsWith() chains. This closes silent snapshot-miss
+ *                    bugs where LLM-generated paths like "././file.py" or "../file.py"
+ *                    survived partial normalization and failed the endsWith() comparison.
  */
 @Component
 public class SimpleTaskOrchestrator {
@@ -49,41 +60,74 @@ public class SimpleTaskOrchestrator {
     private final CriticAgent       critic;
     private final MediatorAgent     mediator;
     private final FileSystemManager fileSystemManager;
+    private final PythonExecutor    pythonExecutor;
 
     private static final int MAX_CONSECUTIVE_REPLANS     = 3;
     private static final int MAX_PLAN_VALIDATION_RETRIES = 2;
-
-    private FileSystemManager.WorkspaceSnapshot workspaceSnapshot = null;
 
     public SimpleTaskOrchestrator(
             PlannerAgent      planner,
             ExecutorAgent     executor,
             CriticAgent       critic,
             MediatorAgent     mediator,
-            FileSystemManager fileSystemManager
+            FileSystemManager fileSystemManager,
+            PythonExecutor    pythonExecutor
     ) {
         this.planner           = planner;
         this.executor          = executor;
         this.critic            = critic;
         this.mediator          = mediator;
         this.fileSystemManager = fileSystemManager;
+        this.pythonExecutor    = pythonExecutor;
     }
 
     // =========================================================================
     // MAIN ENTRY POINT
     // =========================================================================
 
-    /**
-     * Run the full Debugger loop for the given goal.
-     *
-     * @param goal  Natural-language description of the bug to fix (e.g. SWE-bench task string)
-     * @return      Result map with keys: success, totalIterations, status, details
-     */
     public Map<String, Object> runTask(String goal) {
 
         log.info("========== SYNAPSENET LOOP START ==========");
         long startTime = System.currentTimeMillis();
-        workspaceSnapshot = null;
+
+        String workspace = fileSystemManager.getWorkspacePath();
+        if (fileSystemManager.fileExists("setup.py")
+                || fileSystemManager.fileExists("pyproject.toml")
+                || fileSystemManager.fileExists("setup.cfg")) {
+
+            log.info("[PreFlight] Installing repo as editable package...");
+            int installExit = runPreflightCommand(
+                    workspace,
+                    pythonExecutor.getPythonExecutable(),
+                    "-m", "pip", "install", "-e", "."
+            );
+            if (installExit != 0) {
+                log.error("[PreFlight] pip install -e . failed (exit {}). Aborting.", installExit);
+                return failResult(new SharedState(goal), "Pre-flight failed: pip install -e . returned " + installExit);
+            }
+            log.info("[PreFlight] pip install -e . succeeded.");
+        } else {
+            log.info("[PreFlight] No setup.py / pyproject.toml found — skipping editable install.");
+        }
+
+        log.info("[PreFlight] Verifying pytest CLI...");
+        int pytestVersionExit = runPreflightCommand(
+                workspace,
+                pythonExecutor.getPythonExecutable(),
+                "-m", "pytest", "--version"
+        );
+        if (pytestVersionExit != 0) {
+            log.error("[PreFlight] python -m pytest --version failed (exit {}). " +
+                      "Environment is incompatible — aborting before FSM.", pytestVersionExit);
+            return failResult(new SharedState(goal),
+                    "Pre-flight failed: pytest CLI unavailable (exit " + pytestVersionExit + "). " +
+                    "Check Python version and dependency compatibility.");
+        }
+        log.info("[PreFlight] Environment validated.");
+
+        // [FIX item 10] workspaceSnapshot is method-local — not an instance field.
+        FileSystemManager.WorkspaceSnapshot workspaceSnapshot = null;
+        String t0Hash = null;
 
         SharedState state              = new SharedState(goal);
         int         consecutiveReplans = 0;
@@ -92,6 +136,14 @@ public class SimpleTaskOrchestrator {
         state.updatePlan(plan);
 
         while (true) {
+
+            if (state.getLifecycle().isTerminal()) {
+                String msg = String.format(
+                    "[Orchestrator] ILLEGAL: loop continued after terminal state %s",
+                    state.getRepairState());
+                log.error(msg);
+                throw new IllegalStateException(msg);
+            }
 
             state.incrementTotalIterations();
             String currentTask = state.getCurrentTask();
@@ -104,8 +156,13 @@ public class SimpleTaskOrchestrator {
                 log.warn("[Orchestrator] No current task. Triggering replan.");
                 consecutiveReplans++;
 
+                // [FIX Low #12] Increment global replanCount on null-task replan path.
+                state.incrementReplanCount();
+
                 if (consecutiveReplans >= MAX_CONSECUTIVE_REPLANS) {
                     log.error("[Orchestrator] Planner failed {} times. Aborting.", MAX_CONSECUTIVE_REPLANS);
+                    state.getLifecycle().transitionTo(RepairState.ABORTED);
+                    log.info("[FSM FINAL STATE] {}", state.getRepairState());
                     logBenchmark(state, goal, startTime, false, "Planner unable to generate valid plan");
                     return failResult(state, "Planner unable to generate valid plan");
                 }
@@ -122,11 +179,38 @@ public class SimpleTaskOrchestrator {
             consecutiveReplans = 0;
             state.incrementTaskAttempts();
 
+            assertValidPhaseState(state.getCurrentPhase(), state.getRepairState());
+
             // -----------------------------------------------------------------
-            // EXECUTE → CRITIQUE → DECIDE
+            // EXECUTE -> CRITIQUE -> DECIDE
             // -----------------------------------------------------------------
 
             ExecutionResult executionResult = executor.execute(currentTask, state);
+
+            if (executionResult == null) {
+                log.error("[Orchestrator] Executor returned null — infrastructure failure -> ABORTED");
+                state.getLifecycle().transitionTo(RepairState.ABORTED);
+                log.info("[FSM FINAL STATE] {}", state.getRepairState());
+                logBenchmark(state, goal, startTime, false, "Executor returned null");
+                return failResult(state, "Infrastructure failure: executor returned null");
+            }
+
+            if (executionResult.hasErrors()
+                    && executionResult.getErrorSummary() != null
+                    && executionResult.getErrorSummary().startsWith("EXTERNAL_ARTIFACT:")) {
+                String externalPath = executionResult.getErrorSummary()
+                        .substring("EXTERNAL_ARTIFACT:".length()).trim();
+                log.error("[Orchestrator] LLM proposed artifact '{}' not found in workspace -> ABORTED",
+                          externalPath);
+                state.getLifecycle().transitionTo(RepairState.ABORTED);
+                log.info("[FSM FINAL STATE] {}", state.getRepairState());
+                logBenchmark(state, goal, startTime, false,
+                        "External artifact — path not in workspace: " + externalPath);
+                return failResult(state,
+                        "Aborted: LLM proposed file path '" + externalPath +
+                        "' which does not exist in the workspace. " +
+                        "Verify that the repo layout matches expected paths.");
+            }
 
             if (executionResult.getTestResults() != null
                     && executionResult.getTestResults().wereRun()) {
@@ -137,11 +221,32 @@ public class SimpleTaskOrchestrator {
 
             state.recordExecution(executionResult);
 
+            RepairPhase currentPhase = state.getCurrentPhase();
+            if ((currentPhase == RepairPhase.REPRODUCE || currentPhase == RepairPhase.VALIDATE)
+                    && executionResult.getTestResults().wereRun()
+                    && executionResult.getTestExitCode() == -1) {
+                log.error("[Orchestrator] Tests ran but exitCode==-1 — infrastructure failure -> ABORTED");
+                state.getLifecycle().transitionTo(RepairState.ABORTED);
+                log.info("[FSM FINAL STATE] {}", state.getRepairState());
+                logBenchmark(state, goal, startTime, false, "Infrastructure failure: no test exit code");
+                return failResult(state, "Infrastructure failure: tests ran but exit code unavailable");
+            }
+
             CriticFeedback critique = critic.analyze(goal, executionResult, state);
             state.recordCritique(critique);
 
             MediationResult mediation = mediator.decide(executionResult, critique, state);
             log.info("[Orchestrator] Mediator: {}", mediation);
+
+            // [FIX item 5] REPAIR_PATCH tool error bookkeeping — Mediator is read-only.
+            if (state.getCurrentPhase() == RepairPhase.REPAIR_PATCH
+                    && executionResult.hasErrors()
+                    && !executionResult.getTestResults().wereRun()) {
+                state.setLastToolError(executionResult.getErrorSummary());
+                state.incrementConsecutiveToolErrors();
+                log.info("[Orchestrator] REPAIR_PATCH tool error state updated (consecutive={})",
+                        state.getConsecutiveToolErrors());
+            }
 
             MediationDecision decision = mediation.getDecision();
 
@@ -150,7 +255,25 @@ public class SimpleTaskOrchestrator {
             // =================================================================
             if (decision == MediationDecision.SUCCESS) {
 
-                log.info("========== SYNAPSENET SUCCESS ==========");
+                RepairLifecycle lifecycle = state.getLifecycle();
+                RepairPhase phaseOnSuccess = state.getCurrentPhase();
+                RepairState repairStateOnSuccess = state.getRepairState();
+
+                if (phaseOnSuccess == RepairPhase.VALIDATE) {
+                    lifecycle.transitionTo(RepairState.VALIDATED_SUCCESS);
+                } else if (phaseOnSuccess == RepairPhase.REPRODUCE
+                        && repairStateOnSuccess == RepairState.INITIAL) {
+                    lifecycle.transitionTo(RepairState.NO_FAILURE_FOUND);
+                } else {
+                    String msg = String.format(
+                        "[Orchestrator] ILLEGAL SUCCESS: phase=%s, repairState=%s",
+                        phaseOnSuccess, repairStateOnSuccess);
+                    log.error(msg);
+                    throw new IllegalStateException(msg);
+                }
+
+                log.info("========== SYNAPSENET SUCCESS ({}) ==========", state.getRepairState());
+                log.info("[FSM FINAL STATE] {}", state.getRepairState());
                 exportWorkspaceMetadata(state, 0);
                 logBenchmark(state, goal, startTime, true, mediation.getReasoning());
 
@@ -162,7 +285,9 @@ public class SimpleTaskOrchestrator {
             // =================================================================
             if (decision == MediationDecision.FAIL) {
 
+                state.getLifecycle().transitionTo(RepairState.ABORTED);
                 log.warn("========== SYNAPSENET FAILED ==========");
+                log.info("[FSM FINAL STATE] {}", state.getRepairState());
                 exportWorkspaceMetadata(state, 1);
                 logBenchmark(state, goal, startTime, false, mediation.getReasoning());
 
@@ -176,25 +301,39 @@ public class SimpleTaskOrchestrator {
 
                 RepairPhase phase = state.getCurrentPhase();
 
-                // REPRODUCE → REPAIR_ANALYZE
+                // REPRODUCE -> REPAIR_ANALYZE
                 if (phase == RepairPhase.REPRODUCE) {
 
-                    log.info("[Orchestrator] Transition: REPRODUCE → REPAIR_ANALYZE");
+                    log.info("[Orchestrator] Transition: REPRODUCE -> REPAIR_ANALYZE");
+                    state.getLifecycle().transitionTo(RepairState.FAILURE_REPRODUCED);
+                    state.resetTaskAttempts();
                     state.setCurrentPhase(RepairPhase.REPAIR_ANALYZE);
 
                     if (workspaceSnapshot == null) {
                         try {
+                            // [Fix 1] Full workspace snapshot — p -> true.
+                            // The artifact-grounded predicate was incomplete: it missed files
+                            // that were patched but not in the predicate's closed set, causing
+                            // them to be deleted during restore. A full snapshot is mathematically
+                            // deterministic — no patched file can be lost.
+                            //
+                            // Snapshot is taken ONCE here. Never partially. Never expanded.
+                            workspaceSnapshot = fileSystemManager.snapshotWorkspace(p -> true);
                             String failingArtifact = state.getFailingArtifact();
-                            workspaceSnapshot = fileSystemManager.snapshotWorkspace(p -> {
-                                String path           = p.toString().replace('\\', '/');
-                                boolean isUnderSrc    = path.startsWith("src/") && path.endsWith(".py");
-                                boolean isUnderPytest = path.startsWith("_pytest/") && path.endsWith(".py");
-                                boolean isFailingArt  = failingArtifact != null &&
-                                        path.replace('\\', '/').endsWith(failingArtifact.replace('\\', '/'));
-                                return isUnderSrc || isUnderPytest || isFailingArt;
-                            });
-                            log.info("[Orchestrator] Snapshot taken ({} files, artifact: {})",
+                            log.info("[Orchestrator] Full workspace snapshot taken ({} files, artifact: {})",
                                     workspaceSnapshot.size(), failingArtifact);
+                            log.info("[TIMING DEBUG] Snapshot created at REPRODUCE -> REPAIR_ANALYZE");
+                            log.info("[TIMING DEBUG] Snapshot identity={}",
+                                    System.identityHashCode(workspaceSnapshot));
+                            log.info("[SNAPSHOT REF] workspaceSnapshot assigned. identity={}",
+                                    System.identityHashCode(workspaceSnapshot));
+                            try {
+                                t0Hash = fileSystemManager.hashEntireWorkspace(
+                                        java.nio.file.Paths.get(fileSystemManager.getWorkspacePath()));
+                                log.info("[WORKSPACE HASH] T0={}", t0Hash);
+                            } catch (Exception e) {
+                                log.error("[WORKSPACE HASH] Failed to compute T0 hash", e);
+                            }
                         } catch (FileSystemManager.FileSystemException e) {
                             log.error("[Orchestrator] Snapshot failed", e);
                             logBenchmark(state, goal, startTime, false,
@@ -210,21 +349,32 @@ public class SimpleTaskOrchestrator {
                     continue;
                 }
 
-                // REPAIR_ANALYZE → REPAIR_PATCH
+                // REPAIR_ANALYZE -> REPAIR_PATCH
                 if (phase == RepairPhase.REPAIR_ANALYZE) {
 
-                    log.info("[Orchestrator] Transition: REPAIR_ANALYZE → REPAIR_PATCH");
+                    log.info("[Orchestrator] Transition: REPAIR_ANALYZE -> REPAIR_PATCH");
+                    state.getLifecycle().transitionTo(RepairState.ANALYSIS_COMPLETE);
+                    state.resetTaskAttempts();
+                    state.clearToolErrorState();
                     state.setCurrentPhase(RepairPhase.REPAIR_PATCH);
+
+                    // [Fix 1] Snapshot expansion removed. The full workspace snapshot was
+                    // taken at REPRODUCE -> REPAIR_ANALYZE and is used as-is.
+                    // Do NOT re-snapshot — it would reset the baseline and break rollback
+                    // integrity on subsequent REPLAN cycles.
 
                     PlannerOutput patchPlan = generateAndValidateRepairPlan(goal, state);
                     state.updatePlan(patchPlan);
                     continue;
                 }
 
-                // REPAIR_PATCH → VALIDATE
+                // REPAIR_PATCH -> VALIDATE
                 if (phase == RepairPhase.REPAIR_PATCH) {
 
-                    log.info("[Orchestrator] Transition: REPAIR_PATCH → VALIDATE");
+                    log.info("[Orchestrator] Transition: REPAIR_PATCH -> VALIDATE");
+                    state.getLifecycle().transitionTo(RepairState.PATCH_ATTEMPTED);
+                    state.resetTaskAttempts();
+                    state.clearToolErrorState();
                     state.setCurrentPhase(RepairPhase.VALIDATE);
 
                     PlannerOutput validatePlan = planner.generatePlan(goal, state);
@@ -244,7 +394,28 @@ public class SimpleTaskOrchestrator {
             // RETRY
             // =================================================================
             if (decision == MediationDecision.RETRY) {
-                log.info("[Orchestrator] Retrying current task.");
+
+                if (state.getCurrentPhase() == RepairPhase.REPRODUCE
+                        && state.getRepairState() == RepairState.FAILURE_REPRODUCED
+                        && executionResult.getTestResults().wereRun()
+                        && executionResult.getTestExitCode() == 0) {
+                    log.error("[Orchestrator] Failure no longer reproducible after REPLAN -> ABORTED");
+                    state.getLifecycle().transitionTo(RepairState.ABORTED);
+                    log.info("[FSM FINAL STATE] {}", state.getRepairState());
+                    logBenchmark(state, goal, startTime, false,
+                            "Failure not reproducible after workspace restore");
+                    return failResult(state, "Failure no longer reproducible after REPLAN");
+                }
+
+                if (state.getCurrentPhase() == RepairPhase.REPRODUCE
+                        && state.isStructureDiscovered()
+                        && !executionResult.getTestResults().wereRun()) {
+                    log.info("[Orchestrator] REPRODUCE: structure discovered but tests not run — " +
+                             "advancing to next plan step (not replaying discovery task)");
+                    state.advanceToNextTask();
+                } else {
+                    log.info("[Orchestrator] Retrying current task.");
+                }
                 continue;
             }
 
@@ -256,7 +427,32 @@ public class SimpleTaskOrchestrator {
                 log.info("[Orchestrator] Replanning: {}", mediation.getReasoning());
                 state.incrementReplanCount();
 
-                // Capture repair attempt only when REPLAN fires from a repair phase
+                if (state.getCurrentPhase() == RepairPhase.VALIDATE
+                        && state.getRepairState() == RepairState.PATCH_ATTEMPTED) {
+                    log.info("[Orchestrator] VALIDATE failed (exitCode != 0) -> VALIDATED_FAILURE");
+                    state.getLifecycle().transitionTo(RepairState.VALIDATED_FAILURE);
+                }
+
+                if (state.getReplanCount() >= MAX_CONSECUTIVE_REPLANS) {
+                    log.error("[Orchestrator] Replan cap reached ({}) -> ABORTED", MAX_CONSECUTIVE_REPLANS);
+                    state.getLifecycle().transitionTo(RepairState.ABORTED);
+                    log.info("[FSM FINAL STATE] {}", state.getRepairState());
+                    logBenchmark(state, goal, startTime, false, "Replan cap exceeded");
+                    return failResult(state, "Replan cap exceeded — " + mediation.getReasoning());
+                }
+
+                RepairState repairStateAtReplan = state.getRepairState();
+                if (repairStateAtReplan == RepairState.FAILURE_REPRODUCED
+                        || repairStateAtReplan == RepairState.ANALYSIS_COMPLETE
+                        || repairStateAtReplan == RepairState.VALIDATED_FAILURE) {
+                    state.getLifecycle().transitionTo(RepairState.FAILURE_REPRODUCED);
+                    log.info("[Orchestrator] Lifecycle: {} -> FAILURE_REPRODUCED (REPLAN cycle)",
+                            repairStateAtReplan);
+                } else {
+                    log.info("[Orchestrator] REPLAN from repairState={} — lifecycle unchanged",
+                            repairStateAtReplan);
+                }
+
                 RepairPhase phaseAtReplan = state.getCurrentPhase();
                 if (phaseAtReplan == RepairPhase.REPAIR_ANALYZE
                         || phaseAtReplan == RepairPhase.REPAIR_PATCH) {
@@ -267,16 +463,72 @@ public class SimpleTaskOrchestrator {
                 }
 
                 if (workspaceSnapshot != null) {
-                    try {
-                        fileSystemManager.restoreWorkspace(workspaceSnapshot);
-                        workspaceSnapshot = null;
-                        log.info("[Orchestrator] Workspace restored and snapshot reset");
-                    } catch (FileSystemManager.FileSystemException e) {
-                        log.error("[Orchestrator] FATAL: Workspace restore failed. Aborting.", e);
-                        logBenchmark(state, goal, startTime, false,
-                                "Workspace restore failed: " + e.getMessage());
-                        return failResult(state, "Workspace restore failed: " + e.getMessage());
+                    List<String> modifiedFiles = state.getModifiedFiles();
+                    boolean workspaceWasModified = modifiedFiles != null && !modifiedFiles.isEmpty();
+
+                    if (workspaceWasModified) {
+                        try {
+                            log.info("[RESTORE DEBUG] Restoring snapshot identity={}",
+                                    System.identityHashCode(workspaceSnapshot));
+                            log.info("[RESTORE DEBUG] Snapshot file count={}",
+                                    workspaceSnapshot.getFiles().size());
+                            fileSystemManager.restoreWorkspace(workspaceSnapshot);
+                            log.info("[Orchestrator] Workspace restored and snapshot reset");
+                            try {
+                                String restoredHash = fileSystemManager.hashEntireWorkspace(
+                                        java.nio.file.Paths.get(fileSystemManager.getWorkspacePath()));
+                                log.info("[WORKSPACE HASH] AFTER_RESTORE={}", restoredHash);
+                                if (t0Hash != null && !t0Hash.equals(restoredHash)) {
+                                    throw new IllegalStateException(
+                                        "Workspace rollback invariant violated: T0 != AFTER_RESTORE");
+                                }
+                            } catch (IllegalStateException e) {
+                                throw e;
+                            } catch (Exception e) {
+                                log.error("[WORKSPACE HASH] Failed to compute post-restore hash", e);
+                            }
+                        } catch (IllegalStateException e) {
+                            throw e;
+                        } catch (FileSystemManager.FileSystemException e) {
+                            log.error("[Orchestrator] FATAL: Workspace restore failed. Aborting.", e);
+                            logBenchmark(state, goal, startTime, false,
+                                    "Workspace restore failed: " + e.getMessage());
+                            return failResult(state, "Workspace restore failed: " + e.getMessage());
+                        }
+
+                        state.clearFileContentCache();
+                        // [Fix 8] Do NOT call clearFailureContext() after restore.
+                        // Failure context (failingArtifact, subtype, reason) must persist
+                        // across REPLAN cycles so the next REPRODUCE phase can re-ground
+                        // against the correct artifact. workspaceFiles (Fix 5) is also
+                        // preserved — it is never cleared.
+                        // structureDiscovered is reset inside clearFileContentCache().
+                        state.setStructureDiscovered(false);
+                        log.info("[Orchestrator] File content cache cleared after workspace restore " +
+                                 "(failure context preserved, workspace index preserved)");
+
+                        // [Fix 9] Invariant assertion: every file that was modified must exist
+                        // after restore. A full snapshot (Fix 1) guarantees this — this assertion
+                        // catches any regression where the snapshot predicate accidentally narrows.
+                        List<String> modifiedBeforeRestore = state.getModifiedFiles();
+                        for (String f : modifiedBeforeRestore) {
+                            if (!fileSystemManager.fileExists(f)) {
+                                throw new IllegalStateException(
+                                    "Restore invariant violated: modified file '" + f +
+                                    "' is missing after restore. Full snapshot should cover all files.");
+                            }
+                        }
+                        if (!modifiedBeforeRestore.isEmpty()) {
+                            log.info("[Orchestrator] Restore invariant verified: {} modified file(s) present",
+                                    modifiedBeforeRestore.size());
+                        }
+                    } else {
+                        log.info("[Orchestrator] No files modified — skipping workspace restore, " +
+                                 "file cache preserved");
                     }
+
+                    workspaceSnapshot = null;
+                    log.info("[SNAPSHOT REF] workspaceSnapshot assigned. identity=null");
                 } else {
                     log.warn("[Orchestrator] REPLAN triggered but no workspace snapshot exists.");
                 }
@@ -292,9 +544,6 @@ public class SimpleTaskOrchestrator {
                 continue;
             }
 
-            // =================================================================
-            // SAFETY FALLBACK — should never reach here
-            // =================================================================
             log.error("[Orchestrator] Unknown mediator decision: {}", decision);
             logBenchmark(state, goal, startTime, false, "Unknown mediator decision");
             return failResult(state, "Unknown mediator decision: " + decision);
@@ -302,18 +551,62 @@ public class SimpleTaskOrchestrator {
     }
 
     // =========================================================================
+    // PRE-FLIGHT HELPER
+    // =========================================================================
+
+    private int runPreflightCommand(String workingDir, String... command) {
+        try {
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.directory(new java.io.File(workingDir));
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    log.debug("[PreFlight] {}", line);
+                }
+            }
+
+            int exit = process.waitFor();
+            log.info("[PreFlight] Command {} exited with {}", java.util.Arrays.toString(command), exit);
+            return exit;
+        } catch (IOException | InterruptedException e) {
+            log.error("[PreFlight] Command {} failed to start: {}",
+                      java.util.Arrays.toString(command), e.getMessage());
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+            return -1;
+        }
+    }
+
+    // =========================================================================
+    // FSM v1.0: PHASE-STATE PAIRING ASSERTION
+    // =========================================================================
+
+    private void assertValidPhaseState(RepairPhase phase, RepairState repairState) {
+
+        boolean valid = switch (phase) {
+            case REPRODUCE      -> repairState == RepairState.INITIAL
+                                || repairState == RepairState.FAILURE_REPRODUCED;
+            case REPAIR_ANALYZE -> repairState == RepairState.FAILURE_REPRODUCED;
+            case REPAIR_PATCH   -> repairState == RepairState.ANALYSIS_COMPLETE;
+            case VALIDATE       -> repairState == RepairState.PATCH_ATTEMPTED;
+        };
+
+        if (!valid) {
+            String msg = String.format(
+                "[Orchestrator] ILLEGAL PHASE-STATE PAIRING: phase=%s, repairState=%s",
+                phase, repairState);
+            log.error(msg);
+            throw new IllegalStateException(msg);
+        }
+    }
+
+    // =========================================================================
     // PLAN VALIDATION
     // =========================================================================
 
-    /**
-     * Generate and validate a REPAIR_PATCH plan.
-     *
-     * Rejects any plan that contains test-running steps (prohibited in REPAIR_PATCH).
-     * Falls back to PlannerOutput.repairFallback() after MAX_PLAN_VALIDATION_RETRIES.
-     *
-     * The fallback is constructed directly (not via fromJson) to guarantee the
-     * no-test-steps invariant regardless of LLM output.
-     */
     private PlannerOutput generateAndValidateRepairPlan(String goal, SharedState state) {
 
         int validationAttempts = 0;
@@ -352,14 +645,6 @@ public class SimpleTaskOrchestrator {
     // REPAIR HISTORY CAPTURE
     // =========================================================================
 
-    /**
-     * Build and record a RepairAttempt from current state at the moment REPLAN fires.
-     *
-     * PRECONDITIONS:
-     *   - Current phase is REPAIR_ANALYZE or REPAIR_PATCH
-     *   - Called BEFORE softReset() clears lastToolError, collectionFailureSubtype, etc.
-     *   - Called AFTER state.incrementReplanCount()
-     */
     private void captureRepairAttempt(SharedState state, String mediatorReasoning) {
 
         int               attemptNumber = state.getReplanCount();
@@ -375,7 +660,6 @@ public class SimpleTaskOrchestrator {
                     ? RepairAttempt.Outcome.ANALYSIS_INVALID
                     : RepairAttempt.Outcome.ANALYSIS_CAP_EXCEEDED;
         } else {
-            // REPAIR_PATCH
             if (lastToolError != null && lastToolError.contains("not found")) {
                 outcome = RepairAttempt.Outcome.SEARCH_FAILED;
             } else if (lastToolError != null && lastToolError.contains("multiple")) {
@@ -458,10 +742,6 @@ public class SimpleTaskOrchestrator {
         return goal.length() > 30 ? goal.substring(0, 30) : goal;
     }
 
-    /**
-     * Inline benchmark logging — no external DTO.
-     * Produces a single JSON line consumed by SWE-bench adapter and log parsers.
-     */
     private void logBenchmark(SharedState state, String goal, long startTime,
                                boolean success, String finalStatus) {
         long wallTime  = (System.currentTimeMillis() - startTime) / 1000;
@@ -484,11 +764,6 @@ public class SimpleTaskOrchestrator {
         log.info("[Benchmark] {}", json);
     }
 
-    /**
-     * Write synapsenet_metadata.json to the workspace root for the SWE-bench adapter.
-     *
-     * @param exitCode 0 = success, 1 = failure
-     */
     private void exportWorkspaceMetadata(SharedState state, int exitCode) {
         try {
             String       workspacePath = fileSystemManager.getWorkspacePath();

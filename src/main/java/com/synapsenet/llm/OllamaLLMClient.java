@@ -7,6 +7,7 @@ import com.synapsenet.core.agent.AgentType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Profile;
 import org.springframework.http.*;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
@@ -26,6 +27,7 @@ import java.util.Map;
  * Agents must NOT embed system prompts in their own prompt builders.
  */
 @Component
+@Profile("ollama")
 public class OllamaLLMClient implements LLMClient {
 
     private static final Logger log = LoggerFactory.getLogger(OllamaLLMClient.class);

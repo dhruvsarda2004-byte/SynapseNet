@@ -34,16 +34,28 @@ public class ExecutorAgent implements Agent {
     private static final int CONTEXT_WINDOW_LINES    = 80;    // lines above + below failure line
     private static final int MAX_FILE_LINES_FALLBACK = 120;   // used when line number is unknown
 
+    // ✅ AUTHORITATIVE BLOCK: Lines above + below artifactLine for deterministic
+    // search block extraction. Deliberately separate from CONTEXT_WINDOW_LINES —
+    // different purpose, different constraint.
+    //
+    // 5 lines above + target line + 5 lines below = ~11 lines total.
+    // Small enough to avoid duplicate collisions.
+    // Large enough to include structural uniqueness (indentation + control flow).
+    // Stable even if the bug is inside a short function.
+    // Do not exceed 8. Do not go below 3.
+    private static final int AUTHORITATIVE_BLOCK_RADIUS = 5;
+
     private final LLMClient llmClient;
     private final ToolExecutor toolExecutor;
     private final ObjectMapper jsonMapper;
     private final PytestOutputAnalyzer pytestAnalyzer;
 
-    public ExecutorAgent(LLMClient llmClient, ToolExecutor toolExecutor) {
+    public ExecutorAgent(LLMClient llmClient, ToolExecutor toolExecutor,
+                         PytestOutputAnalyzer pytestAnalyzer) {
         this.llmClient    = llmClient;
         this.toolExecutor = toolExecutor;
         this.jsonMapper   = new ObjectMapper();
-        this.pytestAnalyzer = new PytestOutputAnalyzer();
+        this.pytestAnalyzer = pytestAnalyzer;
     }
 
     @Override public String getAgentId()       { return "executor-agent-1"; }
@@ -116,15 +128,15 @@ public class ExecutorAgent implements Agent {
     private ExecutionResult executeRepairAnalyze(String currentTask, SharedState state) {
 
         String prompt = buildRepairAnalyzePrompt(currentTask, state);
-        
-        // ===== DIAGNOSTIC LOGGING (PART 4) =====
+
         // STATE SNAPSHOT before REPAIR_ANALYZE validation
         log.info("[STATE SNAPSHOT] artifact={}, line={}, cachedFiles={}",
                  state.getFailingArtifact(),
                  state.getFailingArtifactLine(),
                  state.getRecentFileReads().keySet());
-        
+
         log.info("[Executor] REPAIR_ANALYZE prompt length: {}", prompt.length());
+        log.info("[Executor] REPAIR_ANALYZE: workspaceFiles.size()={}", state.getWorkspaceFiles().size());
 
         String llmResponse = llmClient.generateWithRole(
                 AgentType.EXECUTOR,
@@ -134,21 +146,195 @@ public class ExecutorAgent implements Agent {
 
         log.info("[Executor] REPAIR_ANALYZE response received ({} chars)", llmResponse.length());
 
-        RootCauseAnalysis analysis = parseAnalysis(llmResponse, state);
-        state.setRootCauseAnalysis(analysis);
+        // ── Pre-cache: extract artifactPath from raw JSON BEFORE validation ──
+        //
+        // Why: parseAnalysis() validates proposedSearchBlock against the file
+        // cache. If the LLM correctly diagnosed a cross-file artifact that isn't
+        // cached yet, validation runs against the wrong file (test file only).
+        // The block passes vacuously, REPAIR_PATCH gets no source content, LLM
+        // patches blind, replace_in_file fails.
+        //
+        // Fix: pre-extract the path, try to cache it NOW, then call parseAnalysis()
+        // so proposedSearchBlock is validated against real file content.
+        //
+        // IMPORTANT: pre-cache failure is a WARNING, not an abort.
+        // The LLM may hallucinate a non-existent path on the first attempt.
+        // If the file doesn't exist, fall through to parseAnalysis() — it will
+        // mark the analysis invalid — then re-prompt so the LLM can correct itself
+        // using the workspace file index. Only abort after retry also fails.
+        String preExtractedArtifact = preExtractArtifactPath(llmResponse, state);
+        if (preExtractedArtifact != null && !state.hasReadFile(preExtractedArtifact)) {
+            String _known = state.getFailingArtifact();
+            boolean _isDifferent = _known == null
+                    || (!preExtractedArtifact.equals(_known)
+                        && !preExtractedArtifact.endsWith(_known)
+                        && !_known.endsWith(preExtractedArtifact));
+            if (_isDifferent) {
+                log.info("[Executor] REPAIR_ANALYZE: Pre-caching '{}' before validation",
+                         preExtractedArtifact);
+                ToolCall _rc = new ToolCall("read_file",
+                        String.format("{\"path\": \"%s\"}", preExtractedArtifact));
+                ToolResult _rr = toolExecutor.execute(_rc, state);
+                if (_rr.getExitCode() == 0) {
+                    log.info("[Executor] REPAIR_ANALYZE: Pre-cache succeeded — " +
+                             "proposedSearchBlock will validate against real file");
+                } else {
+                    // File doesn't exist — LLM hallucinated a path.
+                    // Do NOT abort. Fall through and let the retry re-prompt
+                    // with the workspace file index so the LLM corrects itself.
+                    log.warn("[Executor] REPAIR_ANALYZE: Pre-cache failed — '{}' not in workspace. " +
+                             "Will re-prompt so LLM can pick correct path from file index.",
+                             preExtractedArtifact);
+                }
+            }
+        }
 
-        // ===== DIAGNOSTIC LOGGING (PART 4) =====
-        // ANALYZE RESULT: structured metadata from LLM response
+        // Full parse + proposedSearchBlock validation (source file in cache if pre-cache succeeded)
+        RootCauseAnalysis analysis = parseAnalysis(llmResponse, state);
+
         log.info("[ANALYZE RESULT] artifactPath={}, artifactLine={}",
                  analysis.getArtifactPath(),
                  analysis.getArtifactLine());
 
+        // ── Retry: re-prompt if analysis is invalid ───────────────────────────
+        // Covers two cases:
+        //   (a) LLM hallucinated a path (pre-cache failed) → re-prompt with file index
+        //   (b) proposedSearchBlock didn't match real file → re-prompt with file visible
+        // Only abort with EXTERNAL_ARTIFACT if retry also proposes a missing path.
+        if (!analysis.isValid()) {
+            String llmArtifact   = analysis.getArtifactPath();
+            String knownArtifact = state.getFailingArtifact();
+
+            boolean isDifferentFile = llmArtifact != null
+                    && (knownArtifact == null || (!llmArtifact.equals(knownArtifact)
+                        && !llmArtifact.endsWith(knownArtifact)
+                        && !knownArtifact.endsWith(llmArtifact)));
+
+            // Try to cache it if not already cached (may already be there from pre-cache)
+            if (isDifferentFile && llmArtifact != null && !state.hasReadFile(llmArtifact)) {
+                log.info("[Executor] REPAIR_ANALYZE: Retry — attempting to cache '{}'", llmArtifact);
+                ToolCall readFileCall = new ToolCall("read_file",
+                        String.format("{\"path\": \"%s\"}", llmArtifact));
+                ToolResult readResult = toolExecutor.execute(readFileCall, state);
+                if (readResult.getExitCode() != 0) {
+                    // Still not found after retry attempt — now it's safe to abort
+                    log.error("[Executor] REPAIR_ANALYZE: '{}' still not in workspace after retry → EXTERNAL_ARTIFACT",
+                              llmArtifact);
+                    return ExecutionResult.error("EXTERNAL_ARTIFACT: " + llmArtifact);
+                }
+            }
+
+            // Re-prompt with source file now visible (or with corrected file index guidance)
+            log.info("[Executor] REPAIR_ANALYZE: Re-prompting — source file in cache: {}",
+                     state.getRecentFileReads().keySet());
+            String retryPrompt = buildRepairAnalyzePrompt(currentTask, state);
+            String retryResponse = llmClient.generateWithRole(
+                    AgentType.EXECUTOR,
+                    retryPrompt,
+                    llmClient.getTemperatureForRole(AgentType.EXECUTOR)
+            );
+            log.info("[Executor] REPAIR_ANALYZE: retry response ({} chars)", retryResponse.length());
+
+            // Pre-cache the retry artifact too (LLM may have corrected to a different path)
+            String retryArtifact = preExtractArtifactPath(retryResponse, state);
+            if (retryArtifact != null && !state.hasReadFile(retryArtifact)) {
+                ToolCall rc2 = new ToolCall("read_file",
+                        String.format("{\"path\": \"%s\"}", retryArtifact));
+                ToolResult rr2 = toolExecutor.execute(rc2, state);
+                if (rr2.getExitCode() != 0) {
+                    log.error("[Executor] REPAIR_ANALYZE: Retry artifact '{}' not in workspace → EXTERNAL_ARTIFACT",
+                              retryArtifact);
+                    return ExecutionResult.error("EXTERNAL_ARTIFACT: " + retryArtifact);
+                }
+                log.info("[Executor] REPAIR_ANALYZE: Retry artifact '{}' cached", retryArtifact);
+            }
+
+            analysis = parseAnalysis(retryResponse, state);
+            log.info("[ANALYZE RESULT retry] artifactPath={}, artifactLine={}",
+                     analysis.getArtifactPath(), analysis.getArtifactLine());
+        }
+
+        // ── Grounding: ensure diagnosed artifact is readable BEFORE storing ──
+        //
+        // VALIDATION ORDERING FIX:
+        // state mutation happens AFTER full validation completes — never before.
+        // If the artifact cannot be read, the analysis is invalidated (not aborted),
+        // so the Mediator sees hasValidRootCauseAnalysis()==false and routes to RETRY.
         if (analysis.isValid()) {
-            log.info("[Executor] REPAIR_ANALYZE: Valid analysis stored — {}",
-                    analysis.getRootCauseSummary());
+            String diagnosedArtifact = analysis.getArtifactPath();
+            if (diagnosedArtifact != null && !state.hasReadFile(diagnosedArtifact)) {
+                log.info("[Executor] REPAIR_ANALYZE: Final cache for '{}'", diagnosedArtifact);
+                ToolCall rc = new ToolCall("read_file",
+                        String.format("{\"path\": \"%s\"}", diagnosedArtifact));
+                ToolResult rr = toolExecutor.execute(rc, state);
+                if (rr.getExitCode() != 0) {
+                    // Grounding failed — invalidate BEFORE storing so the Mediator
+                    // can route to RETRY rather than seeing a stored-but-broken analysis.
+                    log.warn("[Executor] REPAIR_ANALYZE: '{}' unresolvable — invalidating analysis",
+                             diagnosedArtifact);
+                    analysis = RootCauseAnalysis.invalid(
+                            "Artifact path unresolvable in workspace: " + diagnosedArtifact);
+                }
+            }
+
+            // ── Authoritative block extraction ────────────────────────────────
+            // Grounding has confirmed the file is readable and cached.
+            // Extract a deterministic search block centered on artifactLine.
+            //
+            // This block comes from the actual file — the LLM cannot hallucinate it.
+            // It is stored on the analysis and injected into REPAIR_PATCH as the
+            // mandatory search_block. The LLM only controls replace_block.
+            //
+            // Done here (after grounding, before storing) so:
+            //   - The block is guaranteed to match real file content.
+            //   - REPLAN cycles preserve it (stored in RootCauseAnalysis, not transient).
+            //   - No recomputation inconsistency.
+            if (analysis.isValid()) {
+                String diagnosedPath    = analysis.getArtifactPath();
+                int    diagnosedLine    = analysis.getArtifactLine();
+                String fileContent      = state.getRecentFileReads().get(diagnosedPath);
+
+                // Handle path normalization variations (e.g. ./ratelimiter/bucket.py vs ratelimiter/bucket.py)
+                if (fileContent == null) {
+                    for (Map.Entry<String, String> entry : state.getRecentFileReads().entrySet()) {
+                        String key = entry.getKey();
+                        if (key.endsWith(diagnosedPath.replaceAll("^\\./", "")) ||
+                            diagnosedPath.replaceAll("^\\./", "").equals(key.replaceAll("^\\./", ""))) {
+                            fileContent = entry.getValue();
+                            break;
+                        }
+                    }
+                }
+
+                if (fileContent != null && diagnosedLine > 0) {
+                    String authBlock = extractAuthoritativeBlock(fileContent, diagnosedLine);
+                    analysis = analysis.withAuthoritativeSearchBlock(authBlock);
+                    log.info("[Executor] REPAIR_ANALYZE: Authoritative block extracted — " +
+                             "{} lines centered on line {} of {}",
+                             authBlock.split("\n", -1).length, diagnosedLine, diagnosedPath);
+                } else {
+                    log.warn("[Executor] REPAIR_ANALYZE: Could not extract authoritative block — " +
+                             "fileContent={}, diagnosedLine={}",
+                             fileContent != null ? "present" : "null", diagnosedLine);
+                }
+
+                log.info("[Executor] REPAIR_ANALYZE: Grounding complete — cache={}",
+                         state.getRecentFileReads().keySet());
+            }
+        }
+
+        // State mutation happens AFTER full validation — never before.
+        // Mediator reads state.hasValidRootCauseAnalysis() directly; storing an
+        // invalid analysis here causes a natural RETRY rather than an ABORTED transition.
+        state.setRootCauseAnalysis(analysis);
+
+        if (analysis.isValid()) {
+            log.info("[Executor] REPAIR_ANALYZE: Valid analysis stored — {}", analysis.getRootCauseSummary());
+            log.info("[Executor] REPAIR_ANALYZE: authoritativeBlock={}, proposedBlock={}",
+                     analysis.hasAuthoritativeSearchBlock() ? "present" : "absent",
+                     analysis.getProposedSearchBlock() != null ? "present" : "absent");
         } else {
-            log.warn("[Executor] REPAIR_ANALYZE: Analysis invalid — {}",
-                    analysis.getInvalidReason());
+            log.warn("[Executor] REPAIR_ANALYZE: Analysis invalid — {}", analysis.getInvalidReason());
         }
 
         // Always return a clean (no-error) ExecutionResult.
@@ -163,23 +349,65 @@ public class ExecutorAgent implements Agent {
         );
     }
 
+    // ====================================================================
+    // AUTHORITATIVE BLOCK EXTRACTION
+    // ====================================================================
+
+    /**
+     * Extract a deterministic search block centered on targetLine.
+     *
+     * Uses AUTHORITATIVE_BLOCK_RADIUS lines above and below targetLine.
+     * Total window ≈ 2 * AUTHORITATIVE_BLOCK_RADIUS + 1 lines.
+     *
+     * Why this constant exists separately from CONTEXT_WINDOW_LINES:
+     *   - CONTEXT_WINDOW_LINES is for reasoning context (LLM needs to see surroundings).
+     *   - AUTHORITATIVE_BLOCK_RADIUS is for deterministic matching (must be unique, not large).
+     *   Different purpose → different constraint.
+     *
+     * NO omission markers are added (unlike extractFileWindow).
+     * The output must be a clean verbatim slice of the file with no decorations,
+     * so replace_in_file can match it byte-for-byte.
+     */
+    private String extractAuthoritativeBlock(String content, int targetLine) {
+        if (content == null || targetLine <= 0) return null;
+
+        String[] lines      = content.split("\n", -1);
+        int      totalLines = lines.length;
+
+        if (targetLine > totalLines) {
+            log.warn("[Executor] extractAuthoritativeBlock: targetLine={} exceeds totalLines={} — clamping",
+                     targetLine, totalLines);
+            targetLine = totalLines;
+        }
+
+        int startLine = Math.max(1, targetLine - AUTHORITATIVE_BLOCK_RADIUS);
+        int endLine   = Math.min(totalLines, targetLine + AUTHORITATIVE_BLOCK_RADIUS);
+
+        StringBuilder sb = new StringBuilder();
+        for (int i = startLine; i <= endLine; i++) {
+            sb.append(lines[i - 1]).append("\n");
+        }
+
+        log.info("[Executor] extractAuthoritativeBlock: lines {}-{} of {} (radius={}, target={})",
+                 startLine, endLine, totalLines, AUTHORITATIVE_BLOCK_RADIUS, targetLine);
+
+        return sb.toString();
+    }
+
+    // ====================================================================
+    // REPAIR_ANALYZE PROMPT BUILDER
+    // ====================================================================
+
     /**
      * Build the REPAIR_ANALYZE prompt.
      *
      * No tool definitions exposed. Instructs the LLM to return ONLY raw JSON.
      * Injects file window, failure context, and (on replan cycles) prior analysis.
-     */
-    /**
-     * Build the REPAIR_ANALYZE prompt.
      *
      * Change 1: Raw pytest failure output injected (exception type, message, stack frames).
-     *           LLM diagnoses from actual failure cause, not file position.
-     * Change 2: Prior failed diagnoses from repairHistory injected directly into ANALYZE
-     *           (not only the Planner). LLM instructed to materially differ.
-     * Change 3: proposedSearchBlock field in JSON schema — LLM must copy from shown code.
-     *           Validated by RootCauseAnalysis against cached file content before advancing.
-     * Change 4: No line-number anchor in prompt framing. LLM finds the faulty line
-     *           from the exception output, not from a pre-supplied hint.
+     * Change 2: Prior failed diagnoses injected. LLM instructed to materially differ.
+     * Change 3: proposedSearchBlock field in JSON schema — informational, not for matching.
+     * Change 4: No line-number anchor in prompt framing.
      */
     private String buildRepairAnalyzePrompt(String currentTask, SharedState state) {
 
@@ -188,9 +416,7 @@ public class ExecutorAgent implements Agent {
         String artifact = state.getFailingArtifact();
         int    failLine = state.getFailingArtifactLine();
 
-        // ── Change 1: Raw pytest failure output ───────────────────────────────
-        // Pass the actual exception type, message, and top stack frames.
-        // Do NOT summarize — the LLM needs the real signal to diagnose correctly.
+        // ── Raw pytest failure output ─────────────────────────────────────────
         TestResults lastResults = state.getLastTestResults();
         if (lastResults != null) {
             String rawOutput = lastResults.getRawOutput();
@@ -210,61 +436,90 @@ public class ExecutorAgent implements Agent {
                 context.append("=== END FAILURE OUTPUT ===\n\n");
                 log.info("[Executor] REPAIR_ANALYZE: injected {} lines of raw failure output", limit);
             } else {
-                // Fallback to structured summary if raw output unavailable
                 context.append("=== FAILURE SUMMARY ===\n");
                 context.append(lastResults.getDetailedFailureSummary());
                 context.append("\n=== END FAILURE SUMMARY ===\n\n");
             }
         }
 
-        // Artifact stated as fact — not as a diagnostic anchor (Change 4)
         if (artifact != null) {
             context.append("Failing file: ").append(artifact).append("\n\n");
         }
 
+        // ── Structured failing line injection (CRITICAL FIX) ─────────────────────
+        if (artifact != null && failLine > 0) {
+            context.append("Failing artifact line: ")
+                   .append(failLine)
+                   .append("\n\n");
+            log.info("[Executor] REPAIR_ANALYZE: injected failing artifact line into prompt: {}", failLine);
+        }
+
+        // ── CHANGE 1: Workspace file index injection (replaces file tree) ────────
+        List<String> workspaceFiles = state.getWorkspaceFiles();
+        if (workspaceFiles != null && !workspaceFiles.isEmpty()) {
+            context.append("=== WORKSPACE FILES (Authoritative Index) ===\n");
+            context.append("These are ALL files in the workspace. You MUST select one by index.\n\n");
+            for (int i = 0; i < workspaceFiles.size(); i++) {
+                context.append(i).append(": ").append(workspaceFiles.get(i)).append("\n");
+            }
+            context.append("\n=== END WORKSPACE FILES ===\n\n");
+            log.info("[Executor] REPAIR_ANALYZE: injected indexed workspace file list ({} files)", workspaceFiles.size());
+        } else {
+            log.warn("[Executor] REPAIR_ANALYZE: no workspace file list in state — LLM will guess paths");
+        }
+
         // ── File window ───────────────────────────────────────────────────────
-        // ✅ FIX: Only inject the FAILING ARTIFACT, not all cached files.
-        // Previously injected ALL cached files, causing LLM to analyze wrong file.
         if (artifact != null && state.hasReadFile(artifact)) {
-            // Failing artifact is cached — inject it specifically
             Map<String, String> files = state.getRecentFileReads();
             String artifactContent = files.get(artifact);
-            
-            // Handle path normalization variations
+
             if (artifactContent == null) {
                 for (String key : files.keySet()) {
                     if (key.endsWith(artifact) || artifact.endsWith(key)) {
                         artifactContent = files.get(key);
-                        artifact = key;  // Use cached key for logging
+                        artifact = key;
                         break;
                     }
                 }
             }
-            
+
             if (artifactContent != null) {
-                context.append("=== FILE CONTENT (failing file) ===\n");
+                context.append("=== FILE CONTENT (test file where pytest reported the error) ===\n");
+                context.append("NOTE: The bug may NOT be in this file — the real fault is likely\n");
+                context.append("in a project source file referenced in the stack trace.\n\n");
                 String excerpt = extractFileWindow(artifactContent, failLine, artifact);
                 context.append("File: ").append(artifact).append("\n");
                 context.append("```python\n");
                 context.append(excerpt);
                 context.append("\n```\n\n");
                 context.append("=== END FILE CONTENT ===\n\n");
-                log.info("[Executor] REPAIR_ANALYZE: Injected file window for {}: lines around {}", 
+                log.info("[Executor] REPAIR_ANALYZE: Injected file window for {}: lines around {}",
                          artifact, failLine);
             }
+
+            // Also inject any other cached files (e.g. source files cached on retry)
+            Map<String, String> allFiles = state.getRecentFileReads();
+            for (Map.Entry<String, String> entry : allFiles.entrySet()) {
+                String cachedPath = entry.getKey();
+                if (cachedPath.equals(artifact)) continue;
+                String cachedContent = entry.getValue();
+                if (cachedContent == null) continue;
+                context.append("=== FILE CONTENT (source file) ===\n");
+                context.append("File: ").append(cachedPath).append("\n");
+                context.append("```python\n");
+                context.append(extractFileWindow(cachedContent, -1, cachedPath));
+                context.append("\n```\n\n");
+                context.append("=== END FILE CONTENT ===\n\n");
+                log.info("[Executor] REPAIR_ANALYZE: Also injected cached source file: {}", cachedPath);
+            }
         } else if (artifact != null) {
-            // Failing artifact not yet cached — LLM must rely on exception output
-            // (Evidence gate in REPAIR_PATCH will read it before patching)
             context.append("Note: File content for ").append(artifact)
                     .append(" not yet cached.\n");
             context.append("Use the exception output above to identify the faulty line.\n\n");
-            log.warn("[Executor] REPAIR_ANALYZE: Failing artifact not cached — {}",
-                     artifact);
+            log.warn("[Executor] REPAIR_ANALYZE: Failing artifact not cached — {}", artifact);
         }
 
-        // ── Change 2: Prior failed diagnoses in ANALYZE prompt ────────────────
-        // Injected here (not only in Planner) so the LLM sees what failed
-        // and produces a materially different diagnosis.
+        // ── Prior failed diagnoses ────────────────────────────────────────────
         List<RepairAttempt> history = state.getRepairHistory();
         RootCauseAnalysis   prior   = state.getLastRootCauseAnalysis();
 
@@ -311,24 +566,33 @@ public class ExecutorAgent implements Agent {
 
                 ## INSTRUCTIONS:
                 - Diagnose from the exception message and stack trace shown above.
-                - Find the exact faulty line from the shown code.
+                - The reported failing artifact is: %s — but this is only where pytest
+                  surfaced the error. The actual bug may be in a source file referenced
+                  in the stack trace. Identify the real bug site.
+                - Set artifactIndex to the index of the SOURCE FILE that contains the bug
+                  (from the WORKSPACE FILES list above), not necessarily the test file.
+                - Find the exact faulty line from the exception output and stack frames.
                 - Do NOT suggest code changes yet. Diagnosis and patch plan only.
-                - artifactPath must match: %s
 
-                ## proposedSearchBlock — CRITICAL:
-                Copy 3+ lines EXACTLY from the file content above surrounding the bug site.
-                Do NOT reconstruct from memory. Do NOT paraphrase.
-                This block will be validated against the actual file.
+                ## proposedSearchBlock — INFORMATIONAL ONLY:
+                Copy 3+ lines from the file content above that you believe surround the bug.
+                This is for traceability only — the system will extract the authoritative
+                search block automatically. Your copy does NOT need to be exact.
+
+                ## JSON FORMAT RULES — CRITICAL:
+                - All string values must escape newlines as \\n. NEVER embed a literal newline
+                  character inside a JSON string value (CTRL-CHAR code 10 causes a parse error).
+                - Example: "proposedSearchBlock": "def foo():\\n    return bar"
 
                 Respond with ONLY this JSON — no markdown fences, no preamble:
 
                 {
-                  "artifactPath": "exact/path/to/file.py",
+                  "artifactIndex": <integer — index from the WORKSPACE FILES list above>,
                   "artifactLine": <integer — the line number of the faulty code>,
                   "rootCauseSummary": "One sentence: what specific code is broken and why it causes the observed exception",
                   "causalExplanation": "How this code path produces the exact exception shown in the failure output",
                   "minimalFixStrategy": "Concrete, specific code change needed — not generic advice",
-                  "proposedSearchBlock": "3+ lines copied EXACTLY from the file content shown above",
+                  "proposedSearchBlock": "3+ lines from the file content above surrounding the bug site",
                   "whyPreviousAttemptsFailed": "Why prior attempts failed, or N/A if first attempt"
                 }
                 """.formatted(
@@ -339,12 +603,50 @@ public class ExecutorAgent implements Agent {
     }
 
     /**
-     * Parse the LLM's raw JSON response into a RootCauseAnalysis.
-     * Strips markdown fences if present. Returns invalid sentinel on any parse error.
+     * Lightweight pre-extraction of artifactPath from raw LLM JSON response.
+     * Tries artifactIndex first (resolved against workspace file list), then
+     * falls back to the legacy artifactPath string field.
      *
-     * Passes concatenated cached file content to RootCauseAnalysis.of() so the
-     * proposedSearchBlock feasibility check can run (normalized comparison).
+     * Called BEFORE full parseAnalysis() so the diagnosed source file can be
+     * cached before proposedSearchBlock validation runs.
+     *
+     * Returns null on any parse failure — non-fatal, full parseAnalysis() handles errors.
      */
+    private String preExtractArtifactPath(String response, SharedState state) {
+        try {
+            String json = response.trim();
+            if (json.startsWith("```")) {
+                json = json.replaceAll("^```[a-z]*\n?", "").replaceAll("```$", "").trim();
+            }
+            JsonNode root = jsonMapper.readTree(json);
+
+            // ── CHANGE 4: Try index resolution first ──────────────────────────
+            List<String> wsFiles = state.getWorkspaceFiles();
+            if (root.has("artifactIndex") && wsFiles != null && !wsFiles.isEmpty()) {
+                int idx = root.get("artifactIndex").asInt(-1);
+                if (idx >= 0 && idx < wsFiles.size()) {
+                    String path = wsFiles.get(idx);
+                    log.info("[Executor] REPAIR_ANALYZE: Pre-extracted artifactIndex={} → '{}'", idx, path);
+                    return path;
+                } else {
+                    log.warn("[Executor] REPAIR_ANALYZE: Pre-extract artifactIndex={} out of bounds (size={})",
+                             idx, wsFiles != null ? wsFiles.size() : 0);
+                }
+            }
+
+            // Fallback: legacy string path field
+            String path = textOrNull(root, RootCauseAnalysis.FIELD_ARTIFACT_PATH);
+            if (path != null) {
+                path = path.replaceAll("^\\./", ""); // normalize ./ prefix
+                log.warn("[Executor] REPAIR_ANALYZE: Pre-extracted legacy artifactPath='{}'", path);
+            }
+            return path;
+        } catch (Exception e) {
+            log.debug("[Executor] REPAIR_ANALYZE: Pre-extract failed (non-fatal): {}", e.getMessage());
+            return null;
+        }
+    }
+
     private RootCauseAnalysis parseAnalysis(String response, SharedState state) {
 
         try {
@@ -355,7 +657,24 @@ public class ExecutorAgent implements Agent {
 
             JsonNode root = jsonMapper.readTree(json);
 
-            String artifactPath      = textOrNull(root, RootCauseAnalysis.FIELD_ARTIFACT_PATH);
+            // ── CHANGE 3: Resolve artifactIndex → path, fall back to string field ──
+            String artifactPath = null;
+            List<String> wsFiles = state.getWorkspaceFiles();
+            if (root.has("artifactIndex") && wsFiles != null && !wsFiles.isEmpty()) {
+                int idx = root.get("artifactIndex").asInt(-1);
+                if (idx >= 0 && idx < wsFiles.size()) {
+                    artifactPath = wsFiles.get(idx);
+                    log.info("[Executor] REPAIR_ANALYZE: artifactIndex={} resolved to '{}'", idx, artifactPath);
+                } else {
+                    log.warn("[Executor] REPAIR_ANALYZE: artifactIndex={} out of bounds (size={})",
+                             idx, wsFiles.size());
+                }
+            } else {
+                artifactPath = textOrNull(root, RootCauseAnalysis.FIELD_ARTIFACT_PATH);
+                if (artifactPath != null)
+                    log.warn("[Executor] REPAIR_ANALYZE: no artifactIndex — fell back to string path '{}'", artifactPath);
+            }
+
             int    artifactLine      = root.has(RootCauseAnalysis.FIELD_ARTIFACT_LINE)
                                        ? root.get(RootCauseAnalysis.FIELD_ARTIFACT_LINE).asInt(0) : 0;
             String rootCause         = textOrNull(root, RootCauseAnalysis.FIELD_ROOT_CAUSE_SUMMARY);
@@ -364,15 +683,11 @@ public class ExecutorAgent implements Agent {
             String prevAttempts      = textOrNull(root, RootCauseAnalysis.FIELD_PREV_ATTEMPTS_EVAL);
             String proposedSearchBlk = textOrNull(root, RootCauseAnalysis.FIELD_PROPOSED_SEARCH_BLOCK);
 
-            // Build concatenated file content for feasibility check.
-            // All cached files are checked — the search block just needs to exist in any one.
             String cachedFileContent = buildCachedFileContent(state);
 
             if (proposedSearchBlk != null) {
-                log.info("[Executor] REPAIR_ANALYZE: proposedSearchBlock present ({} chars) — will validate",
+                log.info("[Executor] REPAIR_ANALYZE: proposedSearchBlock present ({} chars) — informational only",
                         proposedSearchBlk.length());
-            } else {
-                log.info("[Executor] REPAIR_ANALYZE: no proposedSearchBlock in response — skipping feasibility check");
             }
 
             RootCauseAnalysis result = RootCauseAnalysis.of(
@@ -383,8 +698,6 @@ public class ExecutorAgent implements Agent {
             );
 
             // Observability: log artifact path mismatch without blocking.
-            // Fix A: path validation is now soft-only — the LLM may correctly identify
-            // an upstream causal file that differs from the analyzer's heuristic frame.
             String knownArtifact = state.getFailingArtifact();
             if (artifactPath != null && knownArtifact != null) {
                 String normLlm   = artifactPath.replace('\\', '/').replaceAll("^\\./", "").trim();
@@ -407,7 +720,7 @@ public class ExecutorAgent implements Agent {
 
     /**
      * Concatenate all cached file contents for proposedSearchBlock feasibility check.
-     * Returns null if no files are cached (check will be skipped in RootCauseAnalysis).
+     * Returns null if no files are cached.
      */
     private String buildCachedFileContent(SharedState state) {
         if (!state.hasFileContext()) return null;
@@ -454,8 +767,6 @@ public class ExecutorAgent implements Agent {
 
                         """);
 
-                    // ✅ Always use sanitized path in prompt — never expose a corrupted
-                    // multiline artifact string to the LLM or downstream JSON builders.
                     String artifact     = state.getFailingArtifact();
                     String safeArtifact = sanitizeArtifactPath(artifact);
 
@@ -501,7 +812,8 @@ public class ExecutorAgent implements Agent {
         if (state.getCurrentPhase() == RepairPhase.REPAIR_PATCH && state.hasFileContext()) {
 
             context.append("\n### Relevant File Excerpt:\n");
-            context.append("(Copy search_block EXACTLY from here — do not guess content)\n\n");
+            context.append("(The code below is shown exactly as it appears in the file.\n");
+            context.append(" The authoritative search block below was extracted from this content.)\n\n");
 
             int failLine = state.getFailingArtifactLine();
             Map<String, String> files = state.getRecentFileReads();
@@ -519,11 +831,7 @@ public class ExecutorAgent implements Agent {
             log.info("[Executor] Injected {} file(s) into prompt (windowed around line {})",
                     files.size(), failLine);
 
-            // ✅ TOOL ERROR FEEDBACK INJECTION
-            // When the previous replace_in_file failed, inject the error message
-            // and specific corrective instructions directly into the prompt.
-            // This is the only mechanism by which the LLM learns why its last
-            // search_block was rejected — without it, it repeats the same mistake.
+            // Tool error feedback injection
             String lastToolError = state.getLastToolError();
             if (lastToolError != null) {
 
@@ -540,27 +848,23 @@ public class ExecutorAgent implements Agent {
                     context.append("""
                         TO FIX (ambiguous search block):
                         - Your search_block matched more than one location in the file.
-                        - Single-line search blocks like "except ImportError:" are FORBIDDEN.
-                        - You MUST include at least 3–5 lines of surrounding context so the
-                          match is unique. Include the lines immediately before and after
-                          the code you want to change.
-                        - Copy EXACTLY from the numbered window above (without the "  N | " prefix).
+                        - You MUST use the authoritative search block provided below — do not modify it.
 
                         """);
                 } else if (wasNotFound) {
                     context.append("""
                         TO FIX (search block not found):
-                        - Your search_block did not match any text in the file.
-                        - You must copy EXACTLY from the file excerpt shown above.
-                        - Preserve all indentation and whitespace character-for-character.
-                        - Do NOT paraphrase, reconstruct from memory, or invent content.
+                        - Your search_block did not match. You MUST use the authoritative
+                          search block provided below — copy it character-for-character.
+                        - The search_block is a LITERAL string. Do NOT use regex, backslash
+                          escapes, \\s, \\., \\n, or r'' prefix. Whitespace must match exactly.
 
                         """);
                 } else {
                     context.append("""
                         TO FIX:
-                        - Copy search_block EXACTLY from the file excerpt above.
-                        - Include at least 3 lines of context for a unique match.
+                        - Use the authoritative search block provided below exactly as shown.
+                        - The search_block must be a literal string — no regex, no escape sequences.
 
                         """);
                 }
@@ -572,8 +876,6 @@ public class ExecutorAgent implements Agent {
 
         // ================================================================
         // ROOT CAUSE ANALYSIS INJECTION (REPAIR_PATCH only)
-        // Inject the validated analysis from REPAIR_ANALYZE to ground the patch.
-        // The LLM is explicitly required to implement the minimalFixStrategy.
         // ================================================================
         if (state.getCurrentPhase() == RepairPhase.REPAIR_PATCH &&
                 state.hasValidRootCauseAnalysis()) {
@@ -581,10 +883,14 @@ public class ExecutorAgent implements Agent {
             context.append("\n").append(analysis.toRepairPatchPromptBlock()).append("\n");
             context.append("""
 
-                ⚠️ PATCH GROUNDING RULE:
-                Your replace_in_file patch MUST implement the minimalFixStrategy above.
-                A patch that does not target the artifact and line identified in the
-                root cause analysis will be considered misaligned and rejected.
+                ⚠️ PATCH GROUNDING RULES:
+                1. Your search_block MUST be copied CHARACTER-FOR-CHARACTER from the
+                   AUTHORITATIVE SEARCH BLOCK above. Do NOT modify a single character.
+                2. Only your replace_block is under your control.
+                3. A patch that alters the search_block will fail immediately.
+                4. The search_block is a RAW LITERAL STRING — no regex, no backslash
+                   escapes, no \\s, no \\., no \\n. Spaces and newlines must appear exactly
+                   as they do in the file. The tool performs plain string matching only.
 
                 """);
             log.info("[Executor] Root cause analysis injected into REPAIR_PATCH prompt");
@@ -627,17 +933,8 @@ public class ExecutorAgent implements Agent {
 
     /**
      * Extract a windowed excerpt from a file centered on the failure line.
-     *
-     * WHY: Ollama's context is 4096 tokens. A 1084-line file is ~41k chars and gets
-     * silently truncated. The LLM then hallucinates search_block content it never
-     * received, producing "Search block not found" or "found multiple times" loops.
-     *
-     * Each line is prefixed with its real line number so the LLM knows exactly
-     * where in the file it is looking.
-     *
-     * Strategy:
-     *   - failLine known: inject CONTEXT_WINDOW_LINES before and after it (~160 lines)
-     *   - failLine unknown (-1): inject first MAX_FILE_LINES_FALLBACK lines
+     * Used for reasoning context injection (LLM needs to see surroundings).
+     * NOT used for search block matching — see extractAuthoritativeBlock().
      */
     private String extractFileWindow(String content, int failLine, String path) {
 
@@ -659,16 +956,16 @@ public class ExecutorAgent implements Agent {
         StringBuilder sb = new StringBuilder();
 
         if (startLine > 1) {
-            sb.append("# ... (lines 1-").append(startLine - 1).append(" omitted) ...\n");
+            sb.append("# ... (lines 1-").append(startLine - 1).append(" omitted — do not include this marker in search_block) ...\n");
         }
 
         for (int i = startLine; i <= endLine; i++) {
-            sb.append(String.format("%4d | %s\n", i, lines[i - 1]));
+            sb.append(lines[i - 1]).append("\n");
         }
 
         if (endLine < totalLines) {
             sb.append("# ... (lines ").append(endLine + 1)
-              .append("-").append(totalLines).append(" omitted) ...\n");
+              .append("-").append(totalLines).append(" omitted — do not include this marker in search_block) ...\n");
         }
 
         log.info("[Executor] File window for {}: lines {}-{} of {} (failLine={})",
@@ -689,17 +986,19 @@ public class ExecutorAgent implements Agent {
                     Return raw JSON analysis as instructed.
                     """;
 
+            // ── CHANGE 1: Added three ❌ lines explicitly prohibiting regex syntax ──
             case REPAIR_PATCH -> """
                     REPAIR_PATCH: Apply the fix described in the Root Cause Analysis above.
                     You MUST call replace_in_file before finishing — read-only is not enough.
 
-                    SEARCH BLOCK RULES (violations cause tool failure):
-                    ✅ Must contain AT LEAST 3 lines of code — single-line blocks are FORBIDDEN.
-                    ✅ Must include surrounding context lines (lines before and after your target).
-                    ✅ Copy EXACTLY from the file excerpt above — no ">>" marker, no padding prefix.
-                    ✅ Preserve all original indentation and whitespace character-for-character.
-                    ❌ Never use a generic line like "except ImportError:" alone — always include
-                       enough context to make the match unique.
+                    SEARCH BLOCK RULES (violations cause immediate tool failure):
+                    ✅ Use the AUTHORITATIVE SEARCH BLOCK provided above — copy it exactly.
+                    ✅ Do NOT add comments, do NOT alter indentation, do NOT paraphrase.
+                    ✅ Only your replace_block is under your control.
+                    ❌ Do NOT construct your own search_block — use the one provided.
+                    ❌ Do NOT use regex syntax. No \\s, \\., \\n, \\t or any backslash escapes.
+                    ❌ Do NOT prefix with r'' or use any escape sequences.
+                    ❌ The search_block is a LITERAL string — whitespace and newlines must match exactly.
 
                     DO NOT run tests (validation comes next).
                     DO NOT modify test files.
@@ -736,9 +1035,6 @@ public class ExecutorAgent implements Agent {
      * REPAIR evidence gate — generic, no hardcoding.
      *
      * Ensures the failing artifact has been read before a patch is attempted.
-     * All artifact paths are routed through buildReadFileCall() → sanitizeArtifactPath()
-     * before JSON construction — prevents CTRL-CHAR-code-10 Jackson errors from
-     * corrupted multiline artifact strings causing an infinite retry loop.
      */
     private List<ToolCall> enforceRepairEvidenceGate(List<ToolCall> calls, SharedState state) {
 
@@ -790,28 +1086,11 @@ public class ExecutorAgent implements Agent {
     // ARTIFACT PATH SANITIZATION
     // ====================================================================
 
-    /**
-     * Sanitize an artifact path before embedding it in any JSON string or log.
-     *
-     * ROOT CAUSE THIS FIXES:
-     * PytestOutputAnalyzer's FILE_LINE_STANDARD regex historically used [^\"]+
-     * which matched newlines (Java character classes match \n by default).
-     * This caused captures like:
-     *
-     *   ">           six.exec_(co, mod.__dict__)\n\nsrc/_pytest/assertion/rewrite.py"
-     *
-     * When embedded in a JSON string literal this produces a raw newline (code 10),
-     * causing Jackson to throw "Illegal unquoted character (CTRL-CHAR, code 10)"
-     * on every read_file call — resulting in an infinite retry loop.
-     *
-     * Returns null if no clean .py path can be recovered.
-     */
     private String sanitizeArtifactPath(String artifact) {
         if (artifact == null) return null;
 
         String trimmed = artifact.trim();
 
-        // Happy path — already a clean single-line .py path
         if (!trimmed.contains("\n") &&
             !trimmed.contains("\r") &&
             !trimmed.contains(">")  &&
@@ -819,7 +1098,6 @@ public class ExecutorAgent implements Agent {
             return trimmed;
         }
 
-        // Corrupted multiline: scan lines from the end, find last valid .py token
         String[] lines = trimmed.split("[\\r\\n]+");
         for (int i = lines.length - 1; i >= 0; i--) {
             String line = lines[i].trim();
@@ -833,13 +1111,6 @@ public class ExecutorAgent implements Agent {
         return null;
     }
 
-    /**
-     * Build a read_file ToolCall with the artifact path sanitized first.
-     *
-     * Returns an empty list if the path is unrecoverable, so the Mediator
-     * sees a tool-count-of-zero (treated as tool error → RETRY) rather than
-     * a JSON parse crash.
-     */
     private List<ToolCall> buildReadFileCall(String artifact) {
         String safePath = sanitizeArtifactPath(artifact);
         if (safePath == null) {
@@ -856,9 +1127,10 @@ public class ExecutorAgent implements Agent {
 
     private ExecutionResult executeTools(List<ToolCall> toolCalls, String taskDescription, SharedState state) {
 
-        List<ToolResult> toolResults  = new ArrayList<>();
+        List<ToolResult> toolResults   = new ArrayList<>();
         List<String>     modifiedFiles = new ArrayList<>();
         TestResults      testResults   = TestResults.notRun();
+        int              rawTestExitCode = -1;
 
         for (ToolCall call : toolCalls) {
 
@@ -876,13 +1148,40 @@ public class ExecutorAgent implements Agent {
                 log.info("[Executor] File modified: {}", result.getTargetFile());
             }
 
+            if (("file_tree".equals(call.getTool()) || "list_files".equals(call.getTool()))
+                    && result.getExitCode() == 0
+                    && result.getStdout() != null
+                    && !result.getStdout().isBlank()) {
+                state.setWorkspaceFileTree(result.getStdout());
+                log.info("[Executor] Workspace file tree captured ({} chars) from {}",
+                        result.getStdout().length(), call.getTool());
+            }
+
             if ("run_tests".equals(call.getTool())) {
+
+                if (rawTestExitCode != -1) {
+                    log.warn("[Executor] run_tests already executed this iteration — skipping duplicate call");
+                    continue;
+                }
 
                 String rawStdout = result.getStdout();
                 String rawStderr = result.getStderr();
                 String combined  = rawStdout + "\n" + rawStderr;
 
-                testResults = parseTestOutput(combined, result.getExitCode(), state);
+                System.out.println("\n===== RAW PYTEST OUTPUT START =====");
+                System.out.println(combined);
+                System.out.println("===== RAW PYTEST OUTPUT END =====\n");
+
+                rawTestExitCode = result.getExitCode();
+                log.info("[Executor] run_tests rawTestExitCode captured: {}", rawTestExitCode);
+
+                try {
+                    testResults = parseTestOutput(combined, result.getExitCode(), state);
+                } catch (IllegalStateException e) {
+                    log.error("[Executor] Test output parse failed — signal corruption (using fallback): {}",
+                              e.getMessage());
+                    testResults = TestResults.collectionErrorFallback(combined, result.getExitCode());
+                }
 
                 if (result.getExitCode() != 0) {
 
@@ -896,11 +1195,8 @@ public class ExecutorAgent implements Agent {
                     state.setCollectionFailureSubtype(analysis.getSubtype());
                     state.setFailingArtifact(analysis.getFailingArtifact());
                     state.setCollectionFailureReason(analysis.getReason());
-
-                    // Store line number extracted from the stack trace.
-                    // -1 means the analyzer could not find a line number;
-                    // ExecutorAgent will fall back to first-N-lines window.
                     state.setFailingArtifactLine(analysis.getFailingLine());
+
                     if (analysis.getFailingLine() > 0) {
                         log.info("[Signal] failing_artifact_line: {}", analysis.getFailingLine());
                     } else {
@@ -913,11 +1209,6 @@ public class ExecutorAgent implements Agent {
                         log.warn("[Signal] failing_artifact: null");
                     }
 
-                    // ✅ GROUNDING INVARIANT — hard enforcement
-                    // After artifact is identified, immediately cache it.
-                    // If caching fails, abort: REPAIR_ANALYZE must never run without
-                    // cached file content. Returning an error ExecutionResult here
-                    // causes Mediator to see a tool error and trigger RETRY/REPLAN.
                     String failingArtifact = state.getFailingArtifact();
                     if (failingArtifact != null && !state.hasReadFile(failingArtifact)) {
                         log.info("[GROUNDING] Artifact identified but not cached. Reading file: {}",
@@ -929,16 +1220,25 @@ public class ExecutorAgent implements Agent {
                             log.info("[GROUNDING] Artifact cached successfully");
                         } else {
                             log.error("[GROUNDING] Failed to cache artifact — aborting REPRODUCE phase");
-                            return ExecutionResult.error("Grounding failed: unable to cache failing artifact");
+                            return ExecutionResult.errorWithTestResults(
+                                "Grounding failed: unable to cache failing artifact",
+                                testResults,
+                                rawTestExitCode
+                            );
                         }
                     }
                 }
 
                 log.info("[Executor] Tests: {}", testResults.getSummary());
+
+                if (rawTestExitCode != 0) {
+                    log.info("[Executor] Non-zero test exit — stopping tool loop to prevent double run");
+                    break;
+                }
             }
         }
 
-        return new ExecutionResult(taskDescription, toolResults, testResults, modifiedFiles);
+        return new ExecutionResult(taskDescription, toolResults, testResults, modifiedFiles, rawTestExitCode);
     }
 
     private TestResults parseTestOutput(String output, int exitCode, SharedState state) {
@@ -958,18 +1258,25 @@ public class ExecutorAgent implements Agent {
         List<String> passing = new ArrayList<>();
         List<String> failing = new ArrayList<>();
 
-        Pattern pattern = Pattern.compile("([^:]+::[^\\s]+)\\s+(PASSED|FAILED)");
+        Pattern pattern = Pattern.compile("([^:]+::[^\\s]+)\\s+(PASSED|FAILED|ERROR)");
         Matcher matcher = pattern.matcher(output);
 
         while (matcher.find()) {
             String name   = matcher.group(1);
             String status = matcher.group(2);
             if ("PASSED".equals(status)) passing.add(name);
-            else failing.add(name);
+            else if ("FAILED".equals(status) || "ERROR".equals(status)) failing.add(name);
         }
 
         String snippet = (!failing.isEmpty() || (passing.isEmpty() && failing.isEmpty()))
                 ? extractErrorSnippet(output) : null;
+
+        if (exitCode != 0 && failing.isEmpty()) {
+            throw new IllegalStateException(
+                "Signal corruption: exitCode=" + exitCode +
+                " but no failing tests were parsed from pytest output."
+            );
+        }
 
         return new TestResults(passing, failing, output, type, snippet);
     }
